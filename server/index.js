@@ -45,11 +45,11 @@ const PROVIDERS = [
     timeout: 12_000,
   },
   {
-    name: 'Gemini',
-    key: process.env.VOICE_GEMINI_API_KEY,
-    baseURL: 'https://generativelanguage.googleapis.com/v1beta/openai/',
-    model: 'gemini-2.0-flash',
-    timeout: 15_000,
+    name: 'NVIDIA',
+    key: process.env.VOICE_NVIDIA_API_KEY,
+    baseURL: 'https://integrate.api.nvidia.com/v1',
+    model: 'meta/llama-3.3-70b-instruct',
+    timeout: 30_000,
   },
   {
     name: 'OpenRouter',

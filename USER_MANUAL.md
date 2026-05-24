@@ -24,7 +24,7 @@ Voice Trainer 是一個專屬於你的對話風格學習工具。
 |------|---------|------|
 | **Groq** | https://console.groq.com | 免費，每天 14,400 次請求，最快 |
 | **Cerebras** | https://cloud.cerebras.ai | 免費，wafer-scale 超快推理 |
-| **Google Gemini** | https://aistudio.google.com | 免費，點「Get API key」 |
+| **NVIDIA NIM** | https://build.nvidia.com | 免費，登入後點「Get API Key」取得 nvapi-xxx |
 | **OpenRouter** | https://openrouter.ai | 免費 tier，使用 `:free` 後綴模型 |
 
 > **Ollama（選用）：** 本地推理，完全免費、私密、不需帳號。  
@@ -39,7 +39,7 @@ Voice Trainer 是一個專屬於你的對話風格學習工具。
 ```
 VOICE_GROQ_API_KEY=gsk_你的真實key
 VOICE_CEREBRAS_API_KEY=csk_你的真實key
-VOICE_GEMINI_API_KEY=AIza_你的真實key
+VOICE_NVIDIA_API_KEY=nvapi-你的真實key
 VOICE_OPENROUTER_API_KEY=sk-or-v1-你的真實key
 ```
 

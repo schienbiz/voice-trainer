@@ -58,7 +58,7 @@
 | Groq-Llama | Groq | llama-3.3-70b-versatile | 8s | 主要分析 + 話題生成 |
 | Groq-Qwen3 | Groq | qwen/qwen3-32b | 10s | 中文特化分析 |
 | Cerebras | Cerebras | gpt-oss-120b | 12s | 超快交叉驗證 |
-| Gemini | Google AI | gemini-2.0-flash | 15s | 長文深度分析 |
+| NVIDIA | NVIDIA NIM | meta/llama-3.3-70b-instruct | 30s | 深度分析（Gemini 無免費 API 故改用） |
 | OpenRouter | OpenRouter | deepseek-r1-distill-llama-70b:free | 20s | 推理模型多樣性 |
 | Ollama | 本地 | qwen2.5:7b（選用） | 30s | 離線私密推理 |
 
