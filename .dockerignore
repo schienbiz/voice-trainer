@@ -1,0 +1,5 @@
+node_modules/
+.env
+.gstack/
+WORKLOG.md
+USER_MANUAL.md
