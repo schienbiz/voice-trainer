@@ -1,0 +1,20 @@
+{
+  "name": "Voice Trainer — 對話風格學習",
+  "short_name": "Voice Trainer",
+  "description": "收集說話樣本，訓練個人 AI 對話風格",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait-primary",
+  "background_color": "#0d0d15",
+  "theme_color": "#6c63ff",
+  "lang": "zh-TW",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any maskable"
+    }
+  ],
+  "categories": ["productivity", "utilities"]
+}

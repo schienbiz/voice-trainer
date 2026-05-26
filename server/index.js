@@ -5,8 +5,45 @@ import path from 'path'
 import { fileURLToPath } from 'url'
 import OpenAI from 'openai'
 import dotenv from 'dotenv'
+import pkg from 'pg'
+const { Pool } = pkg
 
 dotenv.config()
+
+// ── Neon DB ───────────────────────────────────────────────────────────────────
+const db = process.env.VOICE_DATABASE_URL
+  ? new Pool({ connectionString: process.env.VOICE_DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 3 })
+  : null
+
+async function dbRun(sql, params = []) {
+  if (!db) return null
+  const client = await db.connect()
+  try { return await client.query(sql, params) }
+  finally { client.release() }
+}
+
+async function syncProfileToNeon(profile) {
+  if (!db) return
+  try {
+    await dbRun(
+      `INSERT INTO voice_profile (id, data, updated_at) VALUES ('default', $1, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
+      [JSON.stringify(profile)]
+    )
+  } catch (e) { console.error('[neon] profile sync error:', e.message) }
+}
+
+async function saveSampleToNeon(sample) {
+  if (!db) return
+  try {
+    await dbRun(
+      `INSERT INTO voice_samples (id, category, topic, response, analysis, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+      [sample.id, sample.category, sample.topic, sample.response,
+       JSON.stringify(sample.analysis || {}), sample.at || new Date().toISOString()]
+    )
+  } catch (e) { console.error('[neon] sample sync error:', e.message) }
+}
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT      = path.join(__dirname, '..')
@@ -31,7 +68,7 @@ const PROVIDERS = [
   },
   {
     name: 'Groq-Qwen3',
-    key: process.env.VOICE_GROQ_API_KEY,
+    key: process.env.VOICE_GROQ_QWEN_API_KEY,
     baseURL: 'https://api.groq.com/openai/v1',
     model: 'qwen/qwen3-32b',
     timeout: 10_000,
@@ -55,7 +92,7 @@ const PROVIDERS = [
     name: 'OpenRouter',
     key: process.env.VOICE_OPENROUTER_API_KEY,
     baseURL: 'https://openrouter.ai/api/v1',
-    model: 'deepseek/deepseek-r1-distill-llama-70b:free',
+    model: 'openai/gpt-oss-120b:free',
     timeout: 20_000,
   },
   // Ollama (optional local — activate by running: ollama pull qwen2.5:7b)
@@ -68,19 +105,23 @@ const PROVIDERS = [
   },
 ]
 
-// Circuit breaker — 60s on 429, isolated to this app
+// Circuit breaker — 60s on 429, 24h on 402, isolated to this app
 const _cooldown = {}
 function isCooling(name) {
   if (!_cooldown[name] || Date.now() >= _cooldown[name]) { delete _cooldown[name]; return false }
   return true
 }
-function setCooldown(name) {
-  _cooldown[name] = Date.now() + 60_000
-  console.log(`[circuit] ${name} rate-limited — cooldown 60s`)
+function setCooldown(name, type = '429') {
+  const ms = type === '402' ? 24 * 60 * 60_000 : 60_000
+  _cooldown[name] = Date.now() + ms
+  console.log(`[circuit] ${name} ${type === '402' ? 'credits exhausted — cooldown 24h' : 'rate-limited — cooldown 60s'}`)
 }
 
+// Cached OpenAI clients — avoid recreating on every call
+const _clients = {}
 function makeClient(p) {
-  return new OpenAI({ apiKey: p.key, baseURL: p.baseURL, maxRetries: 0 })
+  if (!_clients[p.name]) _clients[p.name] = new OpenAI({ apiKey: p.key, baseURL: p.baseURL, maxRetries: 0 })
+  return _clients[p.name]
 }
 
 async function callProvider(p, messages, maxTokens = 512) {
@@ -115,7 +156,8 @@ async function callProvider(p, messages, maxTokens = 512) {
     ])
   } catch (err) {
     done = true
-    if (err?.status === 429 || err?.message?.includes('429')) setCooldown(p.name)
+    if (err?.status === 402 || err?.message?.includes('402')) setCooldown(p.name, '402')
+    else if (err?.status === 429 || err?.message?.includes('429')) setCooldown(p.name, '429')
     console.warn(`[voice] ${p.name} failed: ${err.message?.slice(0, 60)}`)
     return null
   }
@@ -160,6 +202,8 @@ const FALLBACK_TOPICS = {
 const app = express()
 app.use(cors())
 app.use(express.json())
+
+app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer' }))
 
 app.get('/api/topic', async (req, res) => {
   const category = req.query.category || 'greeting'
@@ -287,7 +331,10 @@ function updateProfile(profile, analysis, category, userMsg, topic) {
     const map = Object.fromEntries(arr.map(i => [typeof i === 'object' ? i.text : i, typeof i === 'object' ? i.count : 1]))
     for (const item of newItems) {
       const key = item.replace?.(/\s+/g, ' ').trim() || item
-      if (key && key.length < 30) map[key] = (map[key] || 0) + 1
+      // Filter: skip analysis artifacts (contain full-width colon/comma = description text, or too long)
+      if (key && key.length < 20 && !key.includes('：') && !key.includes('，') && !key.includes('習慣') && !key.includes('風格')) {
+        map[key] = (map[key] || 0) + 1
+      }
     }
     return Object.entries(map)
       .sort((a, b) => b[1] - a[1])
@@ -295,7 +342,8 @@ function updateProfile(profile, analysis, category, userMsg, topic) {
       .map(([text, count]) => ({ text, count }))
   }
 
-  profile.patterns.topEmojis    = addWithFreq(profile.patterns.topEmojis || [], analysis.emojis, 15)
+  const emojiOnly = (analysis.emojis || []).filter(e => e && /\p{Extended_Pictographic}/u.test(e))
+  profile.patterns.topEmojis    = addWithFreq(profile.patterns.topEmojis || [], emojiOnly, 15)
   profile.patterns.keyPhrases   = addWithFreq(profile.patterns.keyPhrases || [], analysis.keyPhrases, 20)
   profile.patterns.sentenceEnders = addWithFreq(profile.patterns.sentenceEnders || [], analysis.sentenceEnders, 10)
   profile.patterns.openers      = addWithFreq(profile.patterns.openers || [], analysis.openers, 10)
@@ -342,10 +390,15 @@ app.post('/api/analyze', async (req, res) => {
   writeJSON(PROFILE_FILE, updated)
 
   // Log conversation
+  const sample = { id: Date.now().toString(), category, topic, response: userMsg, analysis: merged, at: new Date().toISOString() }
   const convs = readJSON(CONV_FILE, [])
-  convs.unshift({ id: Date.now().toString(), category, topic, response: userMsg, analysis: merged, at: new Date().toISOString() })
+  convs.unshift(sample)
   if (convs.length > 200) convs.splice(200)
   writeJSON(CONV_FILE, convs)
+
+  // Sync to Neon (fire-and-forget)
+  syncProfileToNeon(updated).catch(() => {})
+  saveSampleToNeon(sample).catch(() => {})
 
   console.log(`[voice] analyzed sample #${updated.totalSamples} — ${merged.modelCount} models, category: ${category}`)
 
@@ -418,7 +471,30 @@ ${examples}
   writeJSON(tmplFile, { generated: new Date().toISOString(), basedOnSamples: profile.totalSamples, templates })
 
   console.log(`[voice] generated ROS templates from ${profile.totalSamples} samples`)
-  res.json({ templates, basedOnSamples: profile.totalSamples })
+
+  // Auto-import into ROS database
+  const rosUrl = process.env.VOICE_ROS_IMPORT_URL
+  let rosImported = 0
+  if (rosUrl) {
+    try {
+      const r = await fetch(`${rosUrl}/api/import-voice-templates`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Voice-Import-Token': process.env.VOICE_ROS_IMPORT_SECRET || '',
+        },
+        body: JSON.stringify({ templates }),
+        signal: AbortSignal.timeout(15_000),
+      })
+      const result = await r.json()
+      rosImported = result.imported || 0
+      console.log(`[voice→ros] imported ${rosImported} templates into ROS database`)
+    } catch (err) {
+      console.warn(`[voice→ros] ROS import failed (non-fatal): ${err.message}`)
+    }
+  }
+
+  res.json({ templates, basedOnSamples: profile.totalSamples, rosImported })
 })
 
 // ── API: Provider status ──────────────────────────────────────────────────────
@@ -458,6 +534,80 @@ ${topPhrases ? `特徵詞彙：${topPhrases}` : ''}
   `.trim()
 }
 
+// ── API: AI Assistant chat ────────────────────────────────────────────────────
+
+app.post('/api/assistant/chat', async (req, res) => {
+  const { messages = [], userMessage, interviewMode = false, interviewCategory = 'greeting', isStart = false } = req.body
+  if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
+
+  const profile = readJSON(PROFILE_FILE, {})
+  const voiceDesc = profile.totalSamples >= 3 ? buildVoiceDescription(profile) : null
+  const catInfo = CATEGORIES[interviewCategory] || CATEGORIES.greeting
+
+  let systemContent
+  if (interviewMode) {
+    systemContent = [
+      `你是說話風格採集夥伴，透過情境問題讓使用者自然說話，從中學習他的對話風格。`,
+      `目前收集類別：${catInfo.label}（${catInfo.desc}）`,
+      `每次：問一個真實具體的情境（要有對象與場景，例：「你同事傳訊息說…你怎麼回？」）`,
+      `使用者回答後：用一句台灣口語自然回應，然後問下一個同類情境。`,
+      `風格：輕鬆友善，台灣口語繁體中文，不說「已記錄」「謝謝提供」等機械語言。`,
+      isStart ? `開場：先用一句話輕鬆打招呼說明目的，馬上問第一個情境。` : '',
+    ].filter(Boolean).join('\n')
+  } else {
+    systemContent = [
+      '你是一個友善輕鬆的對話練習夥伴，幫助使用者練習自然的台灣日常對話。',
+      voiceDesc ? `使用者說話風格：\n${voiceDesc}\n` : '',
+      '用繁體中文（台灣口語）回應，保持簡短（1-3句話），像朋友在 LINE 聊天一樣。不要加任何說明或前綴文字。',
+    ].filter(Boolean).join('\n')
+  }
+
+  const chatMsgs = [
+    { role: 'system', content: systemContent },
+    ...messages.slice(-10),
+  ]
+
+  if (isStart) {
+    chatMsgs.push({ role: 'user', content: '準備好了，請開始！' })
+  } else if (userMessage) {
+    chatMsgs.push({ role: 'user', content: userMessage })
+  }
+
+  const fast = PROVIDERS
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
+    .sort((a, b) => a.timeout - b.timeout)[0] || PROVIDERS[0]
+
+  const reply = await callProvider(fast, chatMsgs, 200)
+  if (!reply) return res.status(503).json({ error: 'AI providers unavailable' })
+
+  res.json({ reply, provider: fast.name })
+})
+
+// ── API: Coach tip ─────────────────────────────────────────────────────────────
+
+app.post('/api/coach', async (req, res) => {
+  const { analysis, userMsg } = req.body
+  if (!analysis) return res.status(400).json({ error: 'no analysis' })
+
+  const coachMsgs = [
+    {
+      role: 'system',
+      content: '你是說話風格教練，給一句精準、具體、鼓勵的建議（不超過25字，繁體中文）。不要以「教練建議：」開頭。',
+    },
+    {
+      role: 'user',
+      content: `正式度${Math.round((analysis.formality||0)*100)}%，溫暖度${Math.round((analysis.warmth||0)*100)}%，幽默感${Math.round((analysis.humor||0)*100)}%，中文${Math.round((analysis.languageRatioZh||0)*100)}%。訊息：「${(userMsg||'').slice(0,80)}」。一句教練建議：`,
+    },
+  ]
+
+  const fast = PROVIDERS
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
+    .sort((a, b) => a.timeout - b.timeout)[0]
+
+  const tip = fast ? await callProvider(fast, coachMsgs, 80) : null
+  res.json({ tip: tip?.replace(/^[「"']|[」"']$/g, '') || '很棒！繼續保持你的自然風格 👍' })
+})
+
 // ── Static frontend (production) ───────────────────────────────────────────────
 
 if (process.env.NODE_ENV === 'production') {
@@ -469,5 +619,44 @@ if (process.env.NODE_ENV === 'production') {
   app.get('/', (req, res) => res.redirect('http://localhost:5173'))
 }
 
+// ── Neon: init schema + migrate existing JSON data ───────────────────────────
+async function initNeon() {
+  if (!db) { console.log('[neon] no VOICE_DATABASE_URL — skipping'); return }
+  try {
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS voice_profile (
+        id TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`)
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS voice_samples (
+        id TEXT PRIMARY KEY,
+        category TEXT NOT NULL,
+        topic TEXT,
+        response TEXT NOT NULL,
+        analysis JSONB DEFAULT '{}',
+        created_at TIMESTAMPTZ DEFAULT NOW()
+      )`)
+    console.log('[neon] schema ready')
+
+    // Migrate existing JSON data if Neon is empty
+    const { rows } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
+    if (rows[0].n === 0) {
+      const localProfile = readJSON(PROFILE_FILE, null)
+      const localSamples = readJSON(CONV_FILE, [])
+      if (localProfile) await syncProfileToNeon(localProfile)
+      for (const s of localSamples) await saveSampleToNeon(s)
+      if (localSamples.length > 0)
+        console.log(`[neon] migrated ${localSamples.length} samples from JSON`)
+    } else {
+      console.log(`[neon] ${rows[0].n} samples already in DB`)
+    }
+  } catch (e) { console.error('[neon] init error:', e.message) }
+}
+
 const PORT = process.env.PORT || 3005
-app.listen(PORT, () => console.log(`[voice-trainer] started on http://localhost:${PORT}`))
+app.listen(PORT, '0.0.0.0', () => {
+  console.log(`[voice-trainer] started on http://localhost:${PORT}`)
+  initNeon()
+})

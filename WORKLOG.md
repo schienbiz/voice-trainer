@@ -59,7 +59,7 @@
 | Groq-Qwen3 | Groq | qwen/qwen3-32b | 10s | 中文特化分析 |
 | Cerebras | Cerebras | gpt-oss-120b | 12s | 超快交叉驗證 |
 | NVIDIA | NVIDIA NIM | meta/llama-3.3-70b-instruct | 30s | 深度分析（Gemini 無免費 API 故改用） |
-| OpenRouter | OpenRouter | deepseek-r1-distill-llama-70b:free | 20s | 推理模型多樣性 |
+| OpenRouter | OpenRouter | openai/gpt-oss-120b:free | 20s | 推理模型多樣性 |
 | Ollama | 本地 | qwen2.5:7b（選用） | 30s | 離線私密推理 |
 
 **Circuit breaker：** 429 → 60s cooldown，與其他專案完全分開的 `_cooldown` map。

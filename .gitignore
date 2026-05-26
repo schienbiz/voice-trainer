@@ -4,4 +4,5 @@ dist/
 data/conversations.json
 data/topics-used.json
 data/templates.json
-# Keep voice-profile.json tracked so Syncthing can sync it
+data/voice-profile.json
+.gstack/
