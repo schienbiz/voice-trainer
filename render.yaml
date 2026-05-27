@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: voice-trainer
+    runtime: node
+    buildCommand: npm run build
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: NODE_ENV
+        value: production
