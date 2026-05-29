@@ -13,6 +13,17 @@ const CATEGORIES = [
   { id: 'support',     label: '情感支持', emoji: '🤗' },
 ]
 
+const STYLE_PRESETS = [
+  { id: 'old-friend',  name: '老朋友',  emoji: '😄', desc: '輕鬆隨性，像老朋友', color: '#f59e0b' },
+  { id: 'gentle',      name: '溫柔關心', emoji: '🥰', desc: '溫柔體貼，多關心對方', color: '#f43f5e' },
+  { id: 'humor',       name: '幽默風趣', emoji: '😂', desc: '幽默風趣，讓對話有趣', color: '#22c55e' },
+  { id: 'formal',      name: '正式有禮', emoji: '🤝', desc: '正式有禮，商務感', color: '#0ea5e9' },
+  { id: 'concise',     name: '簡短直接', emoji: '⚡', desc: '簡短直接，一句話搞定', color: '#6c63ff' },
+  { id: 'energetic',   name: '熱情活潑', emoji: '🔥', desc: '熱情活潑，充滿能量', color: '#f97316' },
+  { id: 'mysterious',  name: '神秘低調', emoji: '🕶️', desc: '神秘低調，讓對方好奇', color: '#8b5cf6' },
+  { id: 'elder',       name: '長輩關懷', emoji: '👴', desc: '長輩關懷，溫暖叮嚀', color: '#10b981' },
+]
+
 function bar(val, label, color = '#6c63ff') {
   const pct = Math.round((val || 0) * 100)
   return (
@@ -39,6 +50,46 @@ function chip(text, count) {
   )
 }
 
+async function streamSSE(url, body, onToken, onDone, onError) {
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    })
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}))
+      onError?.(data.error || `HTTP ${res.status}`)
+      return
+    }
+    const reader = res.body.getReader()
+    const decoder = new TextDecoder()
+    let buf = ''
+    let fullText = ''
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      buf += decoder.decode(value, { stream: true })
+      const lines = buf.split('\n')
+      buf = lines.pop() ?? ''
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue
+        const raw = line.slice(6).trim()
+        if (raw === '[DONE]') { onDone?.(fullText); return }
+        try {
+          const { token, error } = JSON.parse(raw)
+          if (token) { fullText += token; onToken?.(fullText) }
+          else if (error) { onError?.(error); return }
+        } catch {}
+      }
+    }
+    if (fullText) onDone?.(fullText)
+    else onError?.('empty response')
+  } catch (err) {
+    onError?.(err.message)
+  }
+}
+
 export default function App() {
   const [category, setCategory] = useState('greeting')
   const [topic, setTopic]       = useState(null)
@@ -63,10 +114,32 @@ export default function App() {
   const [assistantInput, setAssistantInput] = useState('')
   const [assistantListening, setAssistantListening] = useState(false)
   const [assistantInterim, setAssistantInterim] = useState('')
-  const [sessionSamples, setSessionSamples] = useState(0)
+  const [sessionCatCounts, setSessionCatCounts] = useState({})
   const [coachTip, setCoachTip] = useState(null)
   const assistantRecRef = useRef(null)
+  const assistantInputRef = useRef('')
+  const sendAssistantRef = useRef(null)
   const chatEndRef = useRef(null)
+
+  // 風格練習 tab
+  const [selectedStyle, setSelectedStyle] = useState(null)
+  const [styleChatHistory, setStyleChatHistory] = useState([])
+  const [styleInput, setStyleInput] = useState('')
+  const [styleLoading, setStyleLoading] = useState(false)
+  const [styleListening, setStyleListening] = useState(false)
+  const [styleInterim, setStyleInterim] = useState('')
+  const styleInputRef = useRef('')
+  const styleSendRef = useRef(null)
+  const styleRecRef = useRef(null)
+  const styleChatEndRef = useRef(null)
+
+  // Auto-mic (hands-free mode)
+  const [autoMicEnabled, setAutoMicEnabled] = useState(false)
+  const autoMicRef = useRef(false)
+  const assistantListeningRef = useRef(false)
+  const styleListeningRef = useRef(false)
+  const toggleAssistantVoiceRef = useRef(null)
+  const toggleStyleVoiceRef = useRef(null)
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 768)
@@ -87,6 +160,10 @@ export default function App() {
     chatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [chatHistory])
 
+  useEffect(() => {
+    styleChatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [styleChatHistory])
+
   // Auto-start interview when entering 助手 tab
   useEffect(() => {
     if (tab === 'assistant' && chatHistory.length === 0 && !loading.assistant) {
@@ -94,15 +171,16 @@ export default function App() {
     }
   }, [tab])
 
-  const speak = useCallback((text) => {
-    if (!ttsEnabled || !window.speechSynthesis || !text) return
+  const speak = useCallback((text, onEnd) => {
+    if (!ttsEnabled || !window.speechSynthesis || !text) { onEnd?.(); return }
     window.speechSynthesis.cancel()
     const utt = new SpeechSynthesisUtterance(text)
     utt.lang = 'zh-TW'
-    utt.rate = 1.05
+    utt.rate = 1.1
     const zhVoice = ttsVoices.find(v => v.lang.includes('TW') || v.lang.includes('HK'))
       || ttsVoices.find(v => v.lang.startsWith('zh'))
     if (zhVoice) utt.voice = zhVoice
+    if (onEnd) utt.onend = onEnd
     window.speechSynthesis.speak(utt)
   }, [ttsEnabled, ttsVoices])
 
@@ -238,6 +316,7 @@ export default function App() {
     if (!SR) { alert('此瀏覽器不支援語音輸入，請改用 Chrome 或 Safari。'); return }
 
     if (assistantListening) {
+      if (assistantRecRef.current) assistantRecRef.current._autoSubmit = false
       assistantRecRef.current?.stop()
       return
     }
@@ -246,6 +325,7 @@ export default function App() {
     rec.lang = 'zh-TW'
     rec.continuous = false
     rec.interimResults = true
+    rec._autoSubmit = true  // auto-send when mic ends naturally
     assistantRecRef.current = rec
 
     rec.onstart = () => { setAssistantListening(true); setAssistantInterim('') }
@@ -255,57 +335,75 @@ export default function App() {
         if (r.isFinal) fin += r[0].transcript
         else intr += r[0].transcript
       }
-      if (fin) setAssistantInput(prev => prev ? prev + ' ' + fin : fin)
+      if (fin) {
+        const newVal = assistantInputRef.current ? assistantInputRef.current + ' ' + fin : fin
+        assistantInputRef.current = newVal
+        setAssistantInput(newVal)
+      }
       setAssistantInterim(intr)
     }
     rec.onerror = () => { setAssistantListening(false); setAssistantInterim('') }
-    rec.onend = () => { setAssistantListening(false); setAssistantInterim('') }
+    rec.onend = () => {
+      setAssistantListening(false)
+      setAssistantInterim('')
+      if (rec._autoSubmit && assistantInputRef.current.trim()) {
+        sendAssistantRef.current?.()
+      }
+    }
     rec.start()
   }
 
   function sendToAssistant() {
-    const msg = assistantInput.trim()
+    const msg = (assistantInputRef.current || assistantInput).trim()
     if (!msg || loading.assistant) return
+    assistantInputRef.current = ''
     setAssistantInput('')
     setAssistantInterim('')
 
     const msgId = Date.now().toString()
+    const streamId = msgId + '-ai'
     const catForMsg = interviewCategory
     const lastAIQuestion = chatHistory.filter(m => m.role === 'assistant').slice(-1)[0]?.content || '日常對話練習'
-    const nextCat = CATEGORIES[(sessionSamples + 1) % CATEGORIES.length]
+    const historySnap = chatHistory.map(({ role, content }) => ({ role, content }))
 
-    setChatHistory(h => [...h, { role: 'user', content: msg, saving: true, id: msgId }])
-    setLoading(l => ({ ...l, assistant: true }))
-
-    // Fast path: get AI's next question (~1-2s)
-    fetch(`${API}/assistant/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: chatHistory.map(({ role, content }) => ({ role, content })),
-        userMessage: msg,
-        interviewMode: true,
-        interviewCategory: nextCat.id,
-      }),
-    }).then(r => r.json()).then(data => {
-      if (data.reply) {
-        setChatHistory(h => [...h, { role: 'assistant', content: data.reply }])
-        speak(data.reply)
-        setSessionSamples(n => n + 1)
-      } else {
-        setChatHistory(h => [...h, { role: 'assistant', content: '⚠️ ' + (data.error || '請求失敗') }])
-      }
-    }).catch(() => {
-      setChatHistory(h => [...h, { role: 'assistant', content: '⚠️ 網路錯誤，請稍後重試' }])
-    }).finally(() => {
-      setLoading(l => ({ ...l, assistant: false }))
+    const futureCounts = { ...sessionCatCounts, [catForMsg.id]: (sessionCatCounts[catForMsg.id] || 0) + 1 }
+    const nextCat = CATEGORIES.reduce((best, cat) => {
+      const b = (profile?.byCategory?.[best.id]?.samples || 0) + (futureCounts[best.id] || 0)
+      const c = (profile?.byCategory?.[cat.id]?.samples  || 0) + (futureCounts[cat.id]  || 0)
+      return c < b ? cat : best
     })
 
-    // Slow path: analyze & save as training sample (~8-12s)
+    // Add user message + empty streaming placeholder in one update
+    setChatHistory(h => [...h,
+      { role: 'user', content: msg, saving: true, id: msgId, catLabel: catForMsg.label },
+      { role: 'assistant', content: '', id: streamId, streaming: true },
+    ])
+    setLoading(l => ({ ...l, assistant: true }))
+
+    streamSSE(
+      `${API}/assistant/chat/stream`,
+      { messages: historySnap, userMessage: msg, interviewMode: true, interviewCategory: nextCat.id },
+      (full) => setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full } : m)),
+      (full) => {
+        setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full, streaming: false } : m))
+        setSessionCatCounts(c => ({ ...c, [catForMsg.id]: (c[catForMsg.id] || 0) + 1 }))
+        setLoading(l => ({ ...l, assistant: false }))
+        speak(full, () => {
+          if (autoMicRef.current && !assistantListeningRef.current)
+            setTimeout(() => toggleAssistantVoiceRef.current?.(), 350)
+        })
+      },
+      () => {
+        setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: '⚠️ 連線失敗，請重試', streaming: false } : m))
+        setLoading(l => ({ ...l, assistant: false }))
+      }
+    )
+
+    // Parallel fast analyze (fire-and-forget)
     fetch(`${API}/analyze`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ topic: lastAIQuestion, response: msg, category: catForMsg.id }),
+      body: JSON.stringify({ topic: lastAIQuestion, response: msg, category: catForMsg.id, fast: true }),
     }).then(r => r.json()).then(data => {
       if (data.profile) { setProfile(data.profile); fetchHistory() }
       setChatHistory(h => h.map(m => m.id === msgId ? { ...m, saving: false, saved: true } : m))
@@ -316,33 +414,156 @@ export default function App() {
 
   function startInterview() {
     if (loading.assistant) return
-    setChatHistory([])
-    setSessionSamples(0)
-    setLoading(l => ({ ...l, assistant: true }))
-    fetch(`${API}/assistant/chat`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        messages: [],
-        interviewMode: true,
-        interviewCategory: CATEGORIES[0].id,
-        isStart: true,
-      }),
-    }).then(r => r.json()).then(data => {
-      if (data.reply) {
-        setChatHistory([{ role: 'assistant', content: data.reply, id: 'start' }])
-        speak(data.reply)
-      }
-    }).catch(() => {
-      setChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'start' }])
-    }).finally(() => {
-      setLoading(l => ({ ...l, assistant: false }))
+    setSessionCatCounts({})
+    const firstCat = CATEGORIES.reduce((best, cat) => {
+      const b = profile?.byCategory?.[best.id]?.samples || 0
+      const c = profile?.byCategory?.[cat.id]?.samples  || 0
+      return c < b ? cat : best
     })
+    const streamId = 'start-stream'
+    setChatHistory([{ role: 'assistant', content: '', id: streamId, streaming: true }])
+    setLoading(l => ({ ...l, assistant: true }))
+
+    streamSSE(
+      `${API}/assistant/chat/stream`,
+      { messages: [], interviewMode: true, interviewCategory: firstCat.id, isStart: true },
+      (full) => setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full } : m)),
+      (full) => {
+        setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full, streaming: false } : m))
+        setLoading(l => ({ ...l, assistant: false }))
+        speak(full, () => {
+          if (autoMicRef.current && !assistantListeningRef.current)
+            setTimeout(() => toggleAssistantVoiceRef.current?.(), 350)
+        })
+      },
+      () => {
+        setChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'start' }])
+        setLoading(l => ({ ...l, assistant: false }))
+      }
+    )
+  }
+
+  function startStyleChat(style) {
+    setSelectedStyle(style)
+    styleInputRef.current = ''
+    setStyleInput('')
+    const streamId = 'style-start'
+    setStyleChatHistory([{ role: 'assistant', content: '', id: streamId, streaming: true }])
+    setStyleLoading(true)
+
+    streamSSE(
+      `${API}/style/chat/stream`,
+      { messages: [], styleId: style.id, isStart: true },
+      (full) => setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full } : m)),
+      (full) => {
+        setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full, streaming: false } : m))
+        setStyleLoading(false)
+        speak(full, () => {
+          if (autoMicRef.current && !styleListeningRef.current)
+            setTimeout(() => toggleStyleVoiceRef.current?.(), 350)
+        })
+      },
+      () => {
+        setStyleChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'style-start-err' }])
+        setStyleLoading(false)
+      }
+    )
+  }
+
+  function sendStyleMessage() {
+    const msg = (styleInputRef.current || styleInput).trim()
+    if (!msg || styleLoading) return
+    styleInputRef.current = ''
+    setStyleInput('')
+    setStyleInterim('')
+
+    const msgId = Date.now().toString()
+    const streamId = msgId + '-ai'
+    const historySnap = styleChatHistory.map(({ role, content }) => ({ role, content }))
+
+    setStyleChatHistory(h => [...h,
+      { role: 'user', content: msg, id: msgId },
+      { role: 'assistant', content: '', id: streamId, streaming: true },
+    ])
+    setStyleLoading(true)
+
+    streamSSE(
+      `${API}/style/chat/stream`,
+      { messages: historySnap, userMessage: msg, styleId: selectedStyle.id },
+      (full) => setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full } : m)),
+      (full) => {
+        setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: full, streaming: false } : m))
+        setStyleLoading(false)
+        speak(full, () => {
+          if (autoMicRef.current && !styleListeningRef.current)
+            setTimeout(() => toggleStyleVoiceRef.current?.(), 350)
+        })
+      },
+      () => {
+        setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: '⚠️ 連線失敗，請重試', streaming: false } : m))
+        setStyleLoading(false)
+      }
+    )
+  }
+
+  function toggleStyleVoice() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition
+    if (!SR) { alert('此瀏覽器不支援語音輸入，請改用 Chrome 或 Safari。'); return }
+
+    if (styleListening) {
+      if (styleRecRef.current) styleRecRef.current._autoSubmit = false
+      styleRecRef.current?.stop()
+      return
+    }
+
+    const rec = new SR()
+    rec.lang = 'zh-TW'
+    rec.continuous = false
+    rec.interimResults = true
+    rec._autoSubmit = true
+    styleRecRef.current = rec
+
+    rec.onstart = () => { setStyleListening(true); setStyleInterim('') }
+    rec.onresult = (e) => {
+      let fin = '', intr = ''
+      for (const r of e.results) {
+        if (r.isFinal) fin += r[0].transcript
+        else intr += r[0].transcript
+      }
+      if (fin) {
+        const newVal = styleInputRef.current ? styleInputRef.current + ' ' + fin : fin
+        styleInputRef.current = newVal
+        setStyleInput(newVal)
+      }
+      setStyleInterim(intr)
+    }
+    rec.onerror = () => { setStyleListening(false); setStyleInterim('') }
+    rec.onend = () => {
+      setStyleListening(false)
+      setStyleInterim('')
+      if (rec._autoSubmit && styleInputRef.current.trim()) styleSendRef.current?.()
+    }
+    rec.start()
   }
 
   const totalSamples = profile?.totalSamples || 0
   const readyForExport = totalSamples >= 5
-  const interviewCategory = CATEGORIES[sessionSamples % CATEGORIES.length]
+  const sessionSamples = Object.values(sessionCatCounts).reduce((s, c) => s + c, 0)
+  // Smart category: pick the one with fewest (profile + session) samples
+  const interviewCategory = CATEGORIES.reduce((best, cat) => {
+    const b = (profile?.byCategory?.[best.id]?.samples || 0) + (sessionCatCounts[best.id] || 0)
+    const c = (profile?.byCategory?.[cat.id]?.samples  || 0) + (sessionCatCounts[cat.id]  || 0)
+    return c < b ? cat : best
+  })
+
+  // Keep refs current (all mutated each render so closures never go stale)
+  sendAssistantRef.current = sendToAssistant
+  styleSendRef.current = sendStyleMessage
+  autoMicRef.current = autoMicEnabled
+  assistantListeningRef.current = assistantListening
+  styleListeningRef.current = styleListening
+  toggleAssistantVoiceRef.current = toggleAssistantVoice
+  toggleStyleVoiceRef.current = toggleStyleVoice
 
   // ── Styles ───────────────────────────────────────────────────────────────────
   const s = {
@@ -414,7 +635,7 @@ export default function App() {
       </div>
 
       {/* Mobile: horizontal category scroll (hide for assistant tab) */}
-      {tab !== 'assistant' && (
+      {tab !== 'assistant' && tab !== 'styles' && (
         <div style={s.catScroll}>
           {CATEGORIES.map(cat => {
             const catData = profile?.byCategory?.[cat.id]
@@ -435,7 +656,7 @@ export default function App() {
 
       <div style={s.body}>
         {/* Sidebar — categories (desktop only, hide for assistant tab) */}
-        {tab !== 'assistant' && (
+        {tab !== 'assistant' && tab !== 'styles' && (
           <div style={s.sidebar}>
             <div style={{ padding: '0 16px 12px', fontSize: 11, color: '#555', fontWeight: 600, letterSpacing: 1, textTransform: 'uppercase' }}>對話類別</div>
             {CATEGORIES.map(cat => {
@@ -470,13 +691,13 @@ export default function App() {
         <div style={s.main}>
           {/* Tabs */}
           <div style={{ display: 'flex', gap: 4, marginBottom: 16, overflowX: 'auto', WebkitOverflowScrolling: 'touch', flexShrink: 0 }}>
-            {[['train', '🎙 收集訓練'], ['assistant', '🤖 AI 助手'], ['profile', '📊 風格報告'], ['history', '📜 歷史記錄'], ['templates', '💬 ROS 模板']].map(([id, label]) => (
+            {[['train', '🎙 收集訓練'], ['assistant', '🤖 AI 助手'], ['styles', '🎨 風格練習'], ['profile', '📊 風格報告'], ['history', '📜 歷史記錄'], ['templates', '💬 ROS 模板']].map(([id, label]) => (
               <button key={id} style={s.tabBtn(tab === id)} onClick={() => setTab(id)}>{label}</button>
             ))}
           </div>
 
           {/* Feedback */}
-          {feedback && tab !== 'assistant' && (
+          {feedback && tab !== 'assistant' && tab !== 'styles' && (
             <div style={{ padding: '10px 14px', borderRadius: 8, marginBottom: 16, fontSize: 13,
               background: feedback.type === 'success' ? '#22c55e22' : '#ef444422',
               border: `1px solid ${feedback.type === 'success' ? '#22c55e44' : '#ef444444'}`,
@@ -605,38 +826,67 @@ export default function App() {
           {tab === 'assistant' && (
             <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
               {/* Top bar */}
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8, flexWrap: 'wrap' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '5px 12px', borderRadius: 20, background: '#1e1e2a', border: '1px solid #2a2a3a' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 11px', borderRadius: 20, background: '#6c63ff22', border: '1px solid #6c63ff44' }}>
                     <span>{interviewCategory.emoji}</span>
                     <span style={{ fontSize: 13, color: '#9d96ff', fontWeight: 600 }}>{interviewCategory.label}</span>
                   </div>
                   <span style={{ fontSize: 12, color: '#555' }}>
-                    本次已收集 <strong style={{ color: '#22c55e' }}>{sessionSamples}</strong> 個樣本
+                    本次 <strong style={{ color: '#22c55e' }}>{sessionSamples}</strong> 個
                   </span>
                 </div>
-                <button
-                  onClick={startInterview}
-                  disabled={loading.assistant}
-                  style={{ padding: '5px 12px', borderRadius: 20, border: 'none', background: '#1e1e2a', color: '#666', fontSize: 13, cursor: 'pointer' }}
-                >
-                  ↺ 重新開始
-                </button>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <button
+                    onClick={() => setAutoMicEnabled(e => !e)}
+                    title={autoMicEnabled ? '關閉自動接麥' : '開啟自動接麥（AI說完後自動錄音）'}
+                    style={{
+                      padding: '4px 11px', borderRadius: 20, border: 'none', fontSize: 12, cursor: 'pointer',
+                      background: autoMicEnabled ? '#22c55e22' : '#1e1e2a',
+                      color: autoMicEnabled ? '#22c55e' : '#444',
+                      outline: autoMicEnabled ? '1px solid #22c55e44' : 'none',
+                    }}
+                  >
+                    {autoMicEnabled ? '🔄 自動接麥' : '🔄 手動'}
+                  </button>
+                  <button
+                    onClick={startInterview}
+                    disabled={loading.assistant}
+                    style={{ padding: '4px 11px', borderRadius: 20, border: 'none', background: '#1e1e2a', color: '#555', fontSize: 12, cursor: 'pointer' }}
+                  >
+                    ↺ 重開
+                  </button>
+                </div>
               </div>
-              <div style={{ fontSize: 12, color: '#444', marginBottom: 10 }}>
-                AI 會問你情境問題，用最自然的方式回答，你的回應自動存為訓練樣本。
+
+              {/* Category progress bars */}
+              <div style={{ display: 'flex', gap: 3, marginBottom: 10 }}>
+                {CATEGORIES.map(cat => {
+                  const profCount = profile?.byCategory?.[cat.id]?.samples || 0
+                  const sessCount = sessionCatCounts[cat.id] || 0
+                  const isCurrent = cat.id === interviewCategory.id
+                  const pctProf = Math.min(100, Math.round((profCount / 10) * 100))
+                  const pctSess = Math.min(100 - pctProf, Math.round((sessCount / 10) * 100))
+                  return (
+                    <div key={cat.id} style={{ flex: 1, textAlign: 'center' }}>
+                      <div style={{ fontSize: isMobile ? 10 : 11, marginBottom: 2, opacity: isCurrent ? 1 : 0.45 }}>{cat.emoji}</div>
+                      <div style={{ height: 4, background: '#0d0d15', borderRadius: 2, overflow: 'hidden', outline: isCurrent ? '1px solid #6c63ff55' : 'none', position: 'relative' }}>
+                        <div style={{ position: 'absolute', left: 0, top: 0, height: '100%', width: `${pctProf}%`, background: isCurrent ? '#6c63ff' : '#2a2a4a', borderRadius: 2 }} />
+                        {sessCount > 0 && <div style={{ position: 'absolute', left: `${pctProf}%`, top: 0, height: '100%', width: `${pctSess}%`, background: isCurrent ? '#9d96ff88' : '#44448888', borderRadius: 2 }} />}
+                      </div>
+                      <div style={{ fontSize: 9, color: isCurrent ? '#9d96ff' : '#333', marginTop: 1 }}>
+                        {profCount}{sessCount > 0 ? `+${sessCount}` : ''}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+              <div style={{ fontSize: 11, color: '#444', marginBottom: 8 }}>
+                說完後自動送出 · 回答存為樣本 · 集滿各類別後點「套用到 ROS」
               </div>
 
               {/* Chat messages */}
               <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingBottom: 12 }}>
-                {chatHistory.length === 0 && loading.assistant && (
-                  <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-                    <div style={{ width: 28, height: 28, borderRadius: '50%', background: '#1e1e2a', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 }}>🤖</div>
-                    <div style={{ padding: '10px 14px', borderRadius: '16px 16px 16px 4px', background: '#1e1e2a', fontSize: 13, color: '#555' }}>
-                      準備中<span style={{ animation: 'pulse 1s infinite' }}>…</span>
-                    </div>
-                  </div>
-                )}
                 {chatHistory.map((msg, idx) => (
                   <div key={msg.id || idx} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 8, alignItems: 'flex-end' }}>
                     {msg.role === 'assistant' && (
@@ -650,7 +900,10 @@ export default function App() {
                         background: msg.role === 'user' ? '#6c63ff' : '#1e1e2a',
                         color: '#fff', fontSize: 14, lineHeight: 1.65,
                       }}>
-                        {msg.content}
+                        {msg.streaming && !msg.content
+                          ? <span style={{ color: '#555' }}>思考中<span style={{ animation: 'pulse 1s infinite' }}>…</span></span>
+                          : msg.content}
+                        {msg.streaming && msg.content && <span style={{ color: '#6c63ff', opacity: 0.7 }}> ▋</span>}
                       </div>
                       {msg.role === 'user' && (
                         <div style={{ marginTop: 4, display: 'flex', justifyContent: 'flex-end' }}>
@@ -664,7 +917,7 @@ export default function App() {
                           ) : null}
                         </div>
                       )}
-                      {msg.role === 'assistant' && ttsEnabled && (
+                      {msg.role === 'assistant' && !msg.streaming && ttsEnabled && (
                         <button
                           onClick={() => speak(msg.content)}
                           style={{ marginTop: 4, padding: '2px 10px', borderRadius: 20, border: 'none', background: '#1e1e2a', color: '#555', fontSize: 11, cursor: 'pointer' }}
@@ -680,14 +933,6 @@ export default function App() {
                     )}
                   </div>
                 ))}
-                {loading.assistant && chatHistory.length > 0 && (
-                  <div style={{ display: 'flex', alignItems: 'flex-end', gap: 8 }}>
-                    <div style={{ width: 28, height: 28, borderRadius: '50%', background: '#1e1e2a', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14 }}>🤖</div>
-                    <div style={{ padding: '10px 14px', borderRadius: '16px 16px 16px 4px', background: '#1e1e2a', fontSize: 13, color: '#555' }}>
-                      思考中<span style={{ animation: 'pulse 1s infinite' }}>…</span>
-                    </div>
-                  </div>
-                )}
                 <div ref={chatEndRef} />
               </div>
 
@@ -703,8 +948,8 @@ export default function App() {
                   <textarea
                     style={{ ...s.textarea, minHeight: 52, flex: 1 }}
                     value={assistantInput}
-                    onChange={e => setAssistantInput(e.target.value)}
-                    placeholder="用最自然的方式回答 AI 的問題…"
+                    placeholder="用最自然的方式回答 AI 的問題…（或按 🎤 說完自動送出）"
+                    onChange={e => { assistantInputRef.current = e.target.value; setAssistantInput(e.target.value) }}
                     onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendToAssistant() } }}
                     rows={2}
                   />
@@ -731,6 +976,166 @@ export default function App() {
                 </div>
                 <div style={{ fontSize: 11, color: '#333', marginTop: 6 }}>Enter 送出 · Shift+Enter 換行 · 回答後自動存為樣本</div>
               </div>
+            </div>
+          )}
+
+          {/* ── STYLES TAB ── */}
+          {tab === 'styles' && (
+            <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+              {!selectedStyle ? (
+                <div>
+                  <div style={{ fontSize: 13, color: '#666', marginBottom: 16, lineHeight: 1.6 }}>
+                    選擇一種說話風格，AI 教練會出情境讓你練習，並即時評分回饋。
+                  </div>
+                  <div style={{ display: 'grid', gridTemplateColumns: isMobile ? '1fr 1fr' : 'repeat(4, 1fr)', gap: 10 }}>
+                    {STYLE_PRESETS.map(style => (
+                      <button
+                        key={style.id}
+                        onClick={() => startStyleChat(style)}
+                        style={{
+                          background: '#13131a', border: `1px solid ${style.color}33`,
+                          borderRadius: 12, padding: isMobile ? '14px 10px' : '18px 12px',
+                          cursor: 'pointer', textAlign: 'center', transition: 'all 0.2s',
+                          color: 'inherit',
+                        }}
+                        onMouseEnter={e => { e.currentTarget.style.borderColor = style.color + '88'; e.currentTarget.style.background = style.color + '11' }}
+                        onMouseLeave={e => { e.currentTarget.style.borderColor = style.color + '33'; e.currentTarget.style.background = '#13131a' }}
+                      >
+                        <div style={{ fontSize: isMobile ? 28 : 34, marginBottom: 8 }}>{style.emoji}</div>
+                        <div style={{ fontSize: 13, fontWeight: 600, color: '#fff', marginBottom: 4 }}>{style.name}</div>
+                        <div style={{ fontSize: 11, color: '#666', lineHeight: 1.4 }}>{style.desc}</div>
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              ) : (
+                <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minHeight: 0 }}>
+                  {/* Top bar */}
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8, gap: 8 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                      <button
+                        onClick={() => { setSelectedStyle(null); setStyleChatHistory([]) }}
+                        style={{ padding: '4px 10px', borderRadius: 20, border: 'none', background: '#1e1e2a', color: '#888', fontSize: 12, cursor: 'pointer' }}
+                      >
+                        ← 換風格
+                      </button>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 11px', borderRadius: 20, background: selectedStyle.color + '22', border: `1px solid ${selectedStyle.color}44` }}>
+                        <span>{selectedStyle.emoji}</span>
+                        <span style={{ fontSize: 13, color: selectedStyle.color, fontWeight: 600 }}>{selectedStyle.name}</span>
+                      </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: 6 }}>
+                      <button
+                        onClick={() => setAutoMicEnabled(e => !e)}
+                        title={autoMicEnabled ? '關閉自動接麥' : '開啟自動接麥（AI說完後自動錄音）'}
+                        style={{
+                          padding: '4px 11px', borderRadius: 20, border: 'none', fontSize: 12, cursor: 'pointer',
+                          background: autoMicEnabled ? '#22c55e22' : '#1e1e2a',
+                          color: autoMicEnabled ? '#22c55e' : '#444',
+                          outline: autoMicEnabled ? '1px solid #22c55e44' : 'none',
+                        }}
+                      >
+                        {autoMicEnabled ? '🔄 自動接麥' : '🔄 手動'}
+                      </button>
+                      <button
+                        onClick={() => startStyleChat(selectedStyle)}
+                        disabled={styleLoading}
+                        style={{ padding: '4px 11px', borderRadius: 20, border: 'none', background: '#1e1e2a', color: '#555', fontSize: 12, cursor: 'pointer' }}
+                      >
+                        ↺ 重開
+                      </button>
+                    </div>
+                  </div>
+                  <div style={{ fontSize: 11, color: '#444', marginBottom: 8 }}>
+                    {selectedStyle.desc} · AI 即時評分 · 說完自動送出
+                  </div>
+
+                  {/* Chat messages */}
+                  <div style={{ flex: 1, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 10, paddingBottom: 12 }}>
+                    {styleChatHistory.map((msg, idx) => (
+                      <div key={msg.id || idx} style={{ display: 'flex', justifyContent: msg.role === 'user' ? 'flex-end' : 'flex-start', gap: 8, alignItems: 'flex-end' }}>
+                        {msg.role === 'assistant' && (
+                          <div style={{ width: 28, height: 28, borderRadius: '50%', background: selectedStyle.color + '33', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, flexShrink: 0 }}>
+                            {selectedStyle.emoji}
+                          </div>
+                        )}
+                        <div style={{ maxWidth: '75%' }}>
+                          <div style={{
+                            padding: '10px 14px',
+                            borderRadius: msg.role === 'user' ? '16px 16px 4px 16px' : '16px 16px 16px 4px',
+                            background: msg.role === 'user' ? selectedStyle.color : '#1e1e2a',
+                            color: '#fff', fontSize: 14, lineHeight: 1.65,
+                          }}>
+                            {msg.streaming && !msg.content
+                              ? <span style={{ color: '#555' }}>思考中<span style={{ animation: 'pulse 1s infinite' }}>…</span></span>
+                              : msg.content}
+                            {msg.streaming && msg.content && <span style={{ color: selectedStyle.color, opacity: 0.7 }}> ▋</span>}
+                          </div>
+                          {msg.role === 'assistant' && !msg.streaming && ttsEnabled && (
+                            <button
+                              onClick={() => speak(msg.content)}
+                              style={{ marginTop: 4, padding: '2px 10px', borderRadius: 20, border: 'none', background: '#1e1e2a', color: '#555', fontSize: 11, cursor: 'pointer' }}
+                            >
+                              🔊 重播
+                            </button>
+                          )}
+                        </div>
+                        {msg.role === 'user' && (
+                          <div style={{ width: 28, height: 28, borderRadius: '50%', background: selectedStyle.color + '44', display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 14, flexShrink: 0 }}>
+                            😊
+                          </div>
+                        )}
+                      </div>
+                    ))}
+                    <div ref={styleChatEndRef} />
+                  </div>
+
+                  {/* Input area */}
+                  <div style={{ borderTop: '1px solid #1e1e2a', paddingTop: 12 }}>
+                    {styleListening && (
+                      <div style={{ fontSize: 12, color: '#f59e0b', marginBottom: 6, display: 'flex', alignItems: 'center', gap: 6 }}>
+                        <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#ef4444', display: 'inline-block' }} />
+                        錄音中…{styleInterim && <span style={{ color: '#888', fontStyle: 'italic' }}>{styleInterim}</span>}
+                      </div>
+                    )}
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'flex-end' }}>
+                      <textarea
+                        style={{ ...s.textarea, minHeight: 52, flex: 1 }}
+                        value={styleInput}
+                        onChange={e => { styleInputRef.current = e.target.value; setStyleInput(e.target.value) }}
+                        placeholder={`用「${selectedStyle.name}」風格回答…（或按 🎤 說完自動送出）`}
+                        onKeyDown={e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendStyleMessage() } }}
+                        rows={2}
+                      />
+                      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+                        <button
+                          onClick={toggleStyleVoice}
+                          style={{
+                            padding: '10px 14px', borderRadius: 8, border: 'none', fontSize: 18, cursor: 'pointer',
+                            background: styleListening ? '#ef444433' : '#1e1e2a',
+                            color: styleListening ? '#fca5a5' : '#888',
+                          }}
+                          title="語音輸入"
+                        >
+                          {styleListening ? '⏹' : '🎤'}
+                        </button>
+                        <button
+                          onClick={sendStyleMessage}
+                          disabled={!styleInput.trim() || styleLoading}
+                          style={{
+                            padding: '10px 14px', borderRadius: 8, border: 'none', fontWeight: 600, fontSize: 16,
+                            cursor: 'pointer', background: selectedStyle.color, color: '#fff',
+                            opacity: styleInput.trim() && !styleLoading ? 1 : 0.4,
+                          }}
+                        >
+                          ↑
+                        </button>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 11, color: '#333', marginTop: 6 }}>Enter 送出 · Shift+Enter 換行</div>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
@@ -882,7 +1287,7 @@ export default function App() {
         </div>
 
         {/* Right panel — quick stats (hide for assistant tab) */}
-        {tab !== 'assistant' && (
+        {tab !== 'assistant' && tab !== 'styles' && (
           <div style={s.right}>
             <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 16, color: '#888' }}>快速概覽</div>
 

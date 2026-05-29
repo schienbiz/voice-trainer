@@ -6,13 +6,31 @@ import { fileURLToPath } from 'url'
 import OpenAI from 'openai'
 import dotenv from 'dotenv'
 import pkg from 'pg'
+import { homedir } from 'os'
 const { Pool } = pkg
 
 dotenv.config()
 
-// ── Neon DB ───────────────────────────────────────────────────────────────────
+// ── CockroachDB ───────────────────────────────────────────────────────────────
+// Use CA cert if present (~/.postgresql/root.crt). Needed on macOS Monterey
+// (chusMBp) which doesn't trust CockroachDB's intermediate CA by default.
+// Strip sslmode from URL — pg driver's URL sslmode overrides the ssl config
+// object and prevents the ca cert from being applied.
+const _vtRootCrt = path.join(homedir(), '.postgresql', 'root.crt')
+const _vtSslOpts = fs.existsSync(_vtRootCrt)
+  ? { rejectUnauthorized: true, ca: fs.readFileSync(_vtRootCrt).toString() }
+  : { rejectUnauthorized: true }
+
 const db = process.env.VOICE_DATABASE_URL
-  ? new Pool({ connectionString: process.env.VOICE_DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 3 })
+  ? new Pool({
+      connectionString: (() => {
+        const u = new URL(process.env.VOICE_DATABASE_URL)
+        u.searchParams.delete('sslmode')
+        return u.toString()
+      })(),
+      ssl: _vtSslOpts,
+      max: 3,
+    })
   : null
 
 async function dbRun(sql, params = []) {
@@ -30,7 +48,7 @@ async function syncProfileToNeon(profile) {
        ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
       [JSON.stringify(profile)]
     )
-  } catch (e) { console.error('[neon] profile sync error:', e.message) }
+  } catch (e) { console.error('[db] profile sync error:', e.message) }
 }
 
 async function saveSampleToNeon(sample) {
@@ -42,7 +60,7 @@ async function saveSampleToNeon(sample) {
       [sample.id, sample.category, sample.topic, sample.response,
        JSON.stringify(sample.analysis || {}), sample.at || new Date().toISOString()]
     )
-  } catch (e) { console.error('[neon] sample sync error:', e.message) }
+  } catch (e) { console.error('[db] sample sync error:', e.message) }
 }
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
@@ -183,6 +201,18 @@ const CATEGORIES = {
   gratitude:   { label: '感謝道謝', emoji: '🙏', desc: '道謝、回覆感謝、表達欣賞' },
   sharing:     { label: '分享消息', emoji: '📢', desc: '分享新聞、好東西、有趣的事' },
   support:     { label: '情感支持', emoji: '🤗', desc: '安慰失落、鼓勵加油、陪伴關心' },
+}
+
+// ── Conversation style presets (mirrors Relationship OS STYLE_PRESETS) ─────────
+const STYLE_PRESETS = {
+  'old-friend': { name: '老朋友',  zh: '像老朋友聊天，輕鬆隨性，偶爾開玩笑，不用太正式', desc: '輕鬆隨性，像老朋友' },
+  'gentle':     { name: '溫柔關心', zh: '語氣溫柔體貼，多表達關心，用詞溫暖，偶爾用表情符號', desc: '溫柔體貼，多關心對方' },
+  'humor':      { name: '幽默風趣', zh: '輕鬆幽默，帶點小玩笑，讓對話有趣，但不過分', desc: '幽默風趣，讓對話有趣' },
+  'formal':     { name: '正式有禮', zh: '語氣正式有禮，用詞得體，適合商業或不太熟的關係', desc: '正式有禮，商務感' },
+  'concise':    { name: '簡短直接', zh: '極度簡短，一句話回覆，不廢話，直接到位', desc: '簡短直接，一句話搞定' },
+  'energetic':  { name: '熱情活潑', zh: '熱情洋溢，充滿活力，多用感嘆句和表情符號，讓對方感受到你的興奮', desc: '熱情活潑，充滿能量' },
+  'mysterious': { name: '神秘低調', zh: '說話簡短帶點神秘感，不全說，讓對方想繼續追問', desc: '神秘低調，讓對方好奇' },
+  'elder':      { name: '長輩關懷', zh: '語氣像關心晚輩的長輩，溫暖叮嚀，偶爾給建議，充滿關愛', desc: '長輩關懷，溫暖叮嚀' },
 }
 
 // Pre-built fallback topics when API unavailable
@@ -367,21 +397,23 @@ function updateProfile(profile, analysis, category, userMsg, topic) {
 }
 
 app.post('/api/analyze', async (req, res) => {
-  const { topic, response: userMsg, category } = req.body
+  const { topic, response: userMsg, category, fast = false } = req.body
   if (!userMsg?.trim()) return res.status(400).json({ error: 'empty response' })
 
   const messages = buildAnalyzeMessages(topic, userMsg)
 
-  // Run all providers in parallel
-  const [r1, r2, r3, r4, r5, r6] = await Promise.all(
-    PROVIDERS.map(p => callProvider(p, messages, 400))
-  )
-
-  const analyses = [r1, r2, r3, r4, r5, r6].map(parseStyleJSON)
-  const merged = mergeAnalyses(analyses)
-
-  if (!merged) {
-    return res.status(503).json({ error: 'All AI providers failed — check your API keys in .env' })
+  let merged
+  if (fast) {
+    // Fast path: single fastest available provider (~1-2s)
+    const fp = PROVIDERS.filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama').sort((a, b) => a.timeout - b.timeout)[0]
+    const raw = fp ? await callProvider(fp, messages, 400) : null
+    const analysis = parseStyleJSON(raw)
+    if (!analysis) return res.status(503).json({ error: 'Analysis failed — try again' })
+    merged = { ...analysis, styleNotes: analysis.styleNote ? [analysis.styleNote] : [], modelCount: 1 }
+  } else {
+    const results = await Promise.all(PROVIDERS.map(p => callProvider(p, messages, 400)))
+    merged = mergeAnalyses(results.map(parseStyleJSON))
+    if (!merged) return res.status(503).json({ error: 'All AI providers failed — check your API keys in .env' })
   }
 
   // Update voice profile
@@ -547,12 +579,12 @@ app.post('/api/assistant/chat', async (req, res) => {
   let systemContent
   if (interviewMode) {
     systemContent = [
-      `你是說話風格採集夥伴，透過情境問題讓使用者自然說話，從中學習他的對話風格。`,
-      `目前收集類別：${catInfo.label}（${catInfo.desc}）`,
-      `每次：問一個真實具體的情境（要有對象與場景，例：「你同事傳訊息說…你怎麼回？」）`,
-      `使用者回答後：用一句台灣口語自然回應，然後問下一個同類情境。`,
-      `風格：輕鬆友善，台灣口語繁體中文，不說「已記錄」「謝謝提供」等機械語言。`,
-      isStart ? `開場：先用一句話輕鬆打招呼說明目的，馬上問第一個情境。` : '',
+      `你是說話風格採集夥伴，用情境問題讓使用者自然說話，學習他的對話風格。`,
+      `目前類別：${catInfo.label}（${catInfo.desc}）`,
+      `情境設計：要有具體對象（朋友/同事/家人/客戶）+ 場景（LINE 訊息/當面/群組），每次親密度和壓力不同。`,
+      `使用者回答後：一句台灣口語自然回應（如「哈這樣說蠻自然的」「好，換個角度」），接著馬上問下一個情境。`,
+      `規則：口語繁體中文，一次一個情境，不說「已記錄」「謝謝提供」等機械語言，保持像朋友聊天的感覺。`,
+      isStart ? `開場：一句輕鬆招呼說要練對話風格，馬上問第一個情境，不要解釋太多。` : '',
     ].filter(Boolean).join('\n')
   } else {
     systemContent = [
@@ -581,6 +613,160 @@ app.post('/api/assistant/chat', async (req, res) => {
   if (!reply) return res.status(503).json({ error: 'AI providers unavailable' })
 
   res.json({ reply, provider: fast.name })
+})
+
+// ── API: Style practice ──────────────────────────────────────────────────────
+
+app.get('/api/styles', (req, res) => {
+  res.json(Object.entries(STYLE_PRESETS).map(([id, s]) => ({ id, name: s.name, desc: s.desc })))
+})
+
+app.post('/api/style/chat', async (req, res) => {
+  const { messages = [], userMessage, styleId, isStart = false } = req.body
+  if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
+
+  const style = STYLE_PRESETS[styleId]
+  if (!style) return res.status(400).json({ error: 'unknown style' })
+
+  const systemContent = [
+    `你是對話風格教練，幫使用者練習「${style.name}」風格。`,
+    `「${style.name}」的特色：${style.zh}`,
+    `你的工作流程：`,
+    `1. 給出一個具體的對話情境（明確對象如朋友/同事/家人 + 場景如LINE訊息/當面/群組）`,
+    `2. 使用者回應後，先用1-2句話評估他的表現（幾分/10、哪裡好、哪裡可以更到位），語氣像朋友，不說教`,
+    `3. 馬上出下一個情境`,
+    `規則：繁體中文台灣口語，評分要具體（如「老朋友感有7分！」），不要長篇大論。`,
+    isStart ? `開場：一句輕鬆說今天要練的風格，直接出第一個情境，不要廢話。` : '',
+  ].filter(Boolean).join('\n')
+
+  const chatMsgs = [
+    { role: 'system', content: systemContent },
+    ...messages.slice(-12),
+  ]
+
+  if (isStart) chatMsgs.push({ role: 'user', content: '開始！' })
+  else if (userMessage) chatMsgs.push({ role: 'user', content: userMessage })
+
+  const fast = PROVIDERS
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
+    .sort((a, b) => a.timeout - b.timeout)[0] || PROVIDERS[0]
+
+  const reply = await callProvider(fast, chatMsgs, 300)
+  if (!reply) return res.status(503).json({ error: 'AI providers unavailable' })
+
+  res.json({ reply, provider: fast.name })
+})
+
+// ── SSE streaming helper ─────────────────────────────────────────────────────
+
+async function streamToClient(res, provider, chatMsgs, maxTokens) {
+  res.setHeader('Content-Type', 'text/event-stream')
+  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Connection', 'keep-alive')
+
+  let closed = false
+  res.on('close', () => { closed = true })
+
+  const write = (obj) => {
+    if (!closed && !res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`)
+  }
+
+  try {
+    const client = makeClient(provider)
+    const stream = await client.chat.completions.create({
+      model: provider.model,
+      messages: chatMsgs,
+      max_tokens: maxTokens,
+      temperature: 0.3,
+      stream: true,
+      ...(provider.extraParams || {}),
+    })
+    for await (const chunk of stream) {
+      if (closed) break
+      const token = chunk.choices[0]?.delta?.content
+      if (token) write({ token })
+    }
+  } catch (err) {
+    if (err?.status === 402) setCooldown(provider.name, '402')
+    else if (err?.status === 429) setCooldown(provider.name, '429')
+    console.warn(`[voice] ${provider.name} stream error: ${err.message?.slice(0, 60)}`)
+    write({ error: 'stream interrupted' })
+  } finally {
+    if (!res.writableEnded) {
+      if (!closed) res.write('data: [DONE]\n\n')
+      res.end()
+    }
+  }
+}
+
+function pickFastProvider() {
+  return PROVIDERS
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama' && p.name !== 'Groq-Qwen3')
+    .sort((a, b) => a.timeout - b.timeout)[0]
+}
+
+app.post('/api/assistant/chat/stream', async (req, res) => {
+  const { messages = [], userMessage, interviewMode = false, interviewCategory = 'greeting', isStart = false } = req.body
+  if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
+
+  const profile = readJSON(PROFILE_FILE, {})
+  const voiceDesc = profile.totalSamples >= 3 ? buildVoiceDescription(profile) : null
+  const catInfo = CATEGORIES[interviewCategory] || CATEGORIES.greeting
+
+  let systemContent
+  if (interviewMode) {
+    systemContent = [
+      `你是說話風格採集夥伴，用情境問題讓使用者自然說話，學習他的對話風格。`,
+      `目前類別：${catInfo.label}（${catInfo.desc}）`,
+      `情境設計：要有具體對象（朋友/同事/家人/客戶）+ 場景（LINE 訊息/當面/群組），每次親密度和壓力不同。`,
+      `使用者回答後：一句台灣口語自然回應（如「哈這樣說蠻自然的」「好，換個角度」），接著馬上問下一個情境。`,
+      `規則：口語繁體中文，一次一個情境，不說「已記錄」「謝謝提供」等機械語言，保持像朋友聊天的感覺。`,
+      isStart ? `開場：一句輕鬆招呼說要練對話風格，馬上問第一個情境，不要解釋太多。` : '',
+    ].filter(Boolean).join('\n')
+  } else {
+    systemContent = [
+      '你是一個友善輕鬆的對話練習夥伴，幫助使用者練習自然的台灣日常對話。',
+      voiceDesc ? `使用者說話風格：\n${voiceDesc}\n` : '',
+      '用繁體中文（台灣口語）回應，保持簡短（1-3句話），像朋友在 LINE 聊天一樣。不要加任何說明或前綴文字。',
+    ].filter(Boolean).join('\n')
+  }
+
+  const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-10)]
+  if (isStart) chatMsgs.push({ role: 'user', content: '準備好了，請開始！' })
+  else if (userMessage) chatMsgs.push({ role: 'user', content: userMessage })
+
+  const provider = pickFastProvider()
+  if (!provider) return res.status(503).json({ error: 'no providers available' })
+
+  await streamToClient(res, provider, chatMsgs, 200)
+})
+
+app.post('/api/style/chat/stream', async (req, res) => {
+  const { messages = [], userMessage, styleId, isStart = false } = req.body
+  if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
+
+  const style = STYLE_PRESETS[styleId]
+  if (!style) return res.status(400).json({ error: 'unknown style' })
+
+  const systemContent = [
+    `你是對話風格教練，幫使用者練習「${style.name}」風格。`,
+    `「${style.name}」的特色：${style.zh}`,
+    `你的工作流程：`,
+    `1. 給出一個具體的對話情境（明確對象如朋友/同事/家人 + 場景如LINE訊息/當面/群組）`,
+    `2. 使用者回應後，先用1-2句話評估他的表現（幾分/10、哪裡好、哪裡可以更到位），語氣像朋友，不說教`,
+    `3. 馬上出下一個情境`,
+    `規則：繁體中文台灣口語，評分要具體（如「老朋友感有7分！」），不要長篇大論。`,
+    isStart ? `開場：一句輕鬆說今天要練的風格，直接出第一個情境，不要廢話。` : '',
+  ].filter(Boolean).join('\n')
+
+  const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-12)]
+  if (isStart) chatMsgs.push({ role: 'user', content: '開始！' })
+  else if (userMessage) chatMsgs.push({ role: 'user', content: userMessage })
+
+  const provider = pickFastProvider()
+  if (!provider) return res.status(503).json({ error: 'no providers available' })
+
+  await streamToClient(res, provider, chatMsgs, 300)
 })
 
 // ── API: Coach tip ─────────────────────────────────────────────────────────────
@@ -619,9 +805,9 @@ if (process.env.NODE_ENV === 'production') {
   app.get('/', (req, res) => res.redirect('http://localhost:5173'))
 }
 
-// ── Neon: init schema + migrate existing JSON data ───────────────────────────
+// ── DB: init schema + bidirectional sync with local JSON ─────────────────────
 async function initNeon() {
-  if (!db) { console.log('[neon] no VOICE_DATABASE_URL — skipping'); return }
+  if (!db) { console.log('[db] no VOICE_DATABASE_URL — skipping'); return }
   try {
     await dbRun(`
       CREATE TABLE IF NOT EXISTS voice_profile (
@@ -638,21 +824,38 @@ async function initNeon() {
         analysis JSONB DEFAULT '{}',
         created_at TIMESTAMPTZ DEFAULT NOW()
       )`)
-    console.log('[neon] schema ready')
+    console.log('[db] schema ready')
 
-    // Migrate existing JSON data if Neon is empty
-    const { rows } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
-    if (rows[0].n === 0) {
-      const localProfile = readJSON(PROFILE_FILE, null)
-      const localSamples = readJSON(CONV_FILE, [])
+    const { rows: [{ n: dbCount }] } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
+    const localSamples = readJSON(CONV_FILE, [])
+    const localProfile = readJSON(PROFILE_FILE, null)
+
+    if (dbCount === 0 && localSamples.length > 0) {
+      // Local has data, DB is empty → upload to DB
       if (localProfile) await syncProfileToNeon(localProfile)
       for (const s of localSamples) await saveSampleToNeon(s)
-      if (localSamples.length > 0)
-        console.log(`[neon] migrated ${localSamples.length} samples from JSON`)
+      console.log(`[db] uploaded ${localSamples.length} samples to DB`)
+    } else if (dbCount > 0 && localSamples.length === 0) {
+      // DB has data, local is empty (e.g. Render ephemeral FS) → restore from DB
+      const { rows: samples } = await dbRun(
+        'SELECT id, category, topic, response, analysis, created_at FROM voice_samples ORDER BY created_at ASC'
+      )
+      const { rows: profileRows } = await dbRun(
+        'SELECT data FROM voice_profile WHERE id = $1', ['default']
+      )
+      fs.mkdirSync(DATA_DIR, { recursive: true })
+      const restored = samples.map(r => ({
+        id: r.id, category: r.category, topic: r.topic,
+        response: r.response, analysis: r.analysis,
+        at: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at,
+      }))
+      writeJSON(CONV_FILE, restored)
+      if (profileRows.length > 0) writeJSON(PROFILE_FILE, profileRows[0].data)
+      console.log(`[db] restored ${restored.length} samples from DB to local JSON`)
     } else {
-      console.log(`[neon] ${rows[0].n} samples already in DB`)
+      console.log(`[db] ${dbCount} samples in DB, ${localSamples.length} local — in sync`)
     }
-  } catch (e) { console.error('[neon] init error:', e.message) }
+  } catch (e) { console.error('[db] init error:', e.message) }
 }
 
 const PORT = process.env.PORT || 3005
