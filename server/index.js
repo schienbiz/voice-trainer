@@ -233,7 +233,7 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
-app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer' }))
+app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer', v: 2 }))
 
 app.get('/api/topic', async (req, res) => {
   const category = req.query.category || 'greeting'
