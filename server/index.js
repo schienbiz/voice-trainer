@@ -241,7 +241,8 @@ app.get('/api/topic', async (req, res) => {
   const used = usedTopics[category] || []
 
   // Try AI generation first (Groq is fastest)
-  const groqProvider = PROVIDERS.find(p => p.name === 'Groq-Llama')
+  const groqProvider = PROVIDERS.find(p => p.name === 'Groq-Llama' && !isCooling('Groq-Llama'))
+    || PROVIDERS.find(p => p.name === 'Cerebras' && !isCooling('Cerebras'))
   const aiTopic = groqProvider ? await callProvider(groqProvider, [
     {
       role: 'system',
@@ -250,8 +251,9 @@ app.get('/api/topic', async (req, res) => {
     {
       role: 'user',
       content: `類別：${CATEGORIES[category]?.desc || category}
+現在是台灣${timeLabel()}，情境要符合這個時段會發生的事。
 已使用情境（請避免重複）：${used.slice(-5).join(' / ') || '無'}
-請生成一個新的日常對話情境，讓使用者用自然方式回應。要真實、具體，給出明確的對象和情況。`,
+請生成一個新的日常對話情境，讓使用者用自然方式回應。要真實、具體，給出明確對象和情況，一兩句話就好。`,
     },
   ], 150) : null
 
@@ -453,6 +455,103 @@ app.get('/api/history', (req, res) => {
   res.json(filtered.slice(0, limit))
 })
 
+// ── Template helpers ──────────────────────────────────────────────────────────
+
+const TMPL_FILE = path.join(DATA_DIR, 'templates.json')
+
+// Normalize templates.json → always { generated, basedOnSamples, templates: { cat: [{ text, applied, appliedAt }] } }
+function readTemplates() {
+  const raw = readJSON(TMPL_FILE, null)
+  if (!raw) return null
+  const normalized = {}
+  for (const [cat, items] of Object.entries(raw.templates || {})) {
+    normalized[cat] = (items || []).map(item =>
+      typeof item === 'string'
+        ? { text: item, applied: false, appliedAt: null }
+        : item
+    )
+  }
+  return { ...raw, templates: normalized }
+}
+
+function saveTemplates(tmpl) {
+  writeJSON(TMPL_FILE, tmpl)
+}
+
+async function pushTemplatesToROS(templates) {
+  const rosUrl = process.env.VOICE_ROS_IMPORT_URL
+  if (!rosUrl) return 0
+  // ROS expects flat string arrays per category
+  const flat = Object.fromEntries(
+    Object.entries(templates).map(([cat, items]) => [cat, items.map(i => i.text || i)])
+  )
+  try {
+    const r = await fetch(`${rosUrl}/api/import-voice-templates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Voice-Import-Token': process.env.VOICE_ROS_IMPORT_SECRET || '',
+      },
+      body: JSON.stringify({ templates: flat }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const result = await r.json()
+    return result.imported || 0
+  } catch (err) {
+    console.warn(`[voice→ros] ROS import failed: ${err.message}`)
+    return 0
+  }
+}
+
+// ── API: Get current templates ────────────────────────────────────────────────
+
+app.get('/api/templates', (req, res) => {
+  const tmpl = readTemplates()
+  if (!tmpl) return res.json(null)
+  res.json(tmpl)
+})
+
+// ── API: Apply a single template to ROS ──────────────────────────────────────
+
+app.post('/api/templates/apply', async (req, res) => {
+  const { category, text } = req.body
+  if (!category || !text) return res.status(400).json({ error: 'category and text required' })
+
+  const tmpl = readTemplates()
+  if (!tmpl) return res.status(404).json({ error: 'no templates generated yet' })
+
+  const rosUrl = process.env.VOICE_ROS_IMPORT_URL
+  if (!rosUrl) return res.status(503).json({ error: 'ROS import URL not configured' })
+
+  try {
+    const r = await fetch(`${rosUrl}/api/import-voice-templates`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Voice-Import-Token': process.env.VOICE_ROS_IMPORT_SECRET || '',
+      },
+      body: JSON.stringify({ templates: { [category]: [text] } }),
+      signal: AbortSignal.timeout(15_000),
+    })
+    const result = await r.json()
+    if (result.imported > 0 || result.ok) {
+      // Mark this specific template as applied
+      const now = new Date().toISOString()
+      if (tmpl.templates[category]) {
+        tmpl.templates[category] = tmpl.templates[category].map(item =>
+          item.text === text ? { ...item, applied: true, appliedAt: now } : item
+        )
+        saveTemplates(tmpl)
+      }
+      console.log(`[voice→ros] applied 1 template: [${category}] ${text.slice(0, 40)}`)
+      return res.json({ ok: true })
+    }
+    return res.status(500).json({ error: 'ROS returned 0 imported' })
+  } catch (err) {
+    return res.status(503).json({ error: err.message })
+  }
+})
+
 // ── API: Generate Relationship OS templates ───────────────────────────────────
 
 app.post('/api/generate-templates', async (req, res) => {
@@ -462,7 +561,6 @@ app.post('/api/generate-templates', async (req, res) => {
   }
 
   const examples = readJSON(CONV_FILE, []).slice(0, 10).map(c => `[${c.category}] ${c.response}`).join('\n')
-
   const voiceDesc = buildVoiceDescription(profile)
 
   const templatePrompt = [
@@ -485,48 +583,36 @@ ${examples}
     },
   ]
 
-  // Use best available provider for template generation
-  let templates = null
+  let rawTemplates = null
   for (const p of PROVIDERS) {
     const raw = await callProvider(p, templatePrompt, 1000)
     if (!raw) continue
     try {
       const match = raw.match(/\{[\s\S]*\}/)
-      if (match) { templates = JSON.parse(match[0]); break }
+      if (match) { rawTemplates = JSON.parse(match[0]); break }
     } catch { continue }
   }
 
-  if (!templates) return res.status(503).json({ error: 'Template generation failed — try again' })
+  if (!rawTemplates) return res.status(503).json({ error: 'Template generation failed — try again' })
 
-  // Save templates
-  const tmplFile = path.join(DATA_DIR, 'templates.json')
-  writeJSON(tmplFile, { generated: new Date().toISOString(), basedOnSamples: profile.totalSamples, templates })
+  // Auto-import into ROS
+  const rosImported = await pushTemplatesToROS(
+    Object.fromEntries(Object.entries(rawTemplates).map(([cat, items]) => [cat, items.map(t => ({ text: t }))]))
+  )
+  const now = new Date().toISOString()
 
-  console.log(`[voice] generated ROS templates from ${profile.totalSamples} samples`)
+  // Normalize to tracked format — mark as applied if ROS accepted them
+  const trackedTemplates = Object.fromEntries(
+    Object.entries(rawTemplates).map(([cat, items]) => [
+      cat,
+      items.map(text => ({ text, applied: rosImported > 0, appliedAt: rosImported > 0 ? now : null })),
+    ])
+  )
 
-  // Auto-import into ROS database
-  const rosUrl = process.env.VOICE_ROS_IMPORT_URL
-  let rosImported = 0
-  if (rosUrl) {
-    try {
-      const r = await fetch(`${rosUrl}/api/import-voice-templates`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'X-Voice-Import-Token': process.env.VOICE_ROS_IMPORT_SECRET || '',
-        },
-        body: JSON.stringify({ templates }),
-        signal: AbortSignal.timeout(15_000),
-      })
-      const result = await r.json()
-      rosImported = result.imported || 0
-      console.log(`[voice→ros] imported ${rosImported} templates into ROS database`)
-    } catch (err) {
-      console.warn(`[voice→ros] ROS import failed (non-fatal): ${err.message}`)
-    }
-  }
+  saveTemplates({ generated: now, basedOnSamples: profile.totalSamples, templates: trackedTemplates })
+  console.log(`[voice] generated templates from ${profile.totalSamples} samples — ROS imported: ${rosImported}`)
 
-  res.json({ templates, basedOnSamples: profile.totalSamples, rosImported })
+  res.json({ templates: trackedTemplates, basedOnSamples: profile.totalSamples, rosImported })
 })
 
 // ── API: Provider status ──────────────────────────────────────────────────────
@@ -657,6 +743,34 @@ app.post('/api/style/chat', async (req, res) => {
   res.json({ reply, provider: fast.name })
 })
 
+// ── Conversation variety helpers ─────────────────────────────────────────────
+
+function timeLabel() {
+  const h = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' })).getHours()
+  if (h < 6)  return '深夜'
+  if (h < 11) return '早上'
+  if (h < 14) return '中午'
+  if (h < 18) return '下午'
+  if (h < 22) return '晚上'
+  return '夜晚'
+}
+
+// 8 opening hooks — rotate by second so each session feels different
+const OPENING_HOOKS = [
+  '開場時先說一句輕鬆的廢話（天氣/今天怎樣/最近在忙啥），讓對話感覺像真實對話才開始情境。',
+  '直接丟一個很生活的具體情境，不廢話，像突然傳訊息給朋友一樣。',
+  '開場帶一點懸念：先描述情況的「問題」，讓使用者想幫忙解決。',
+  '以角色扮演方式開場：你是他的朋友，突然傳了一則訊息，讓他回應。',
+  '先分享一件你（AI）剛經歷的小事，再問他遇到類似情況怎麼說。',
+  '用一個反問開場：「如果你的同事這樣說你會怎麼回？」直接給對話截圖文字。',
+  '帶出一個多人情境（群組/聚會），讓他的回覆對象更明確有趣。',
+  '從一個真實場景出發（捷運上/咖啡廳/公司茶水間），讓情境立體。',
+]
+
+function openingHook() {
+  return OPENING_HOOKS[Math.floor(Date.now() / 1000) % OPENING_HOOKS.length]
+}
+
 // ── SSE streaming helper ─────────────────────────────────────────────────────
 
 async function streamToClient(res, provider, chatMsgs, maxTokens) {
@@ -677,7 +791,7 @@ async function streamToClient(res, provider, chatMsgs, maxTokens) {
       model: provider.model,
       messages: chatMsgs,
       max_tokens: maxTokens,
-      temperature: 0.3,
+      temperature: 0.75,
       stream: true,
       ...(provider.extraParams || {}),
     })
@@ -712,16 +826,18 @@ app.post('/api/assistant/chat/stream', async (req, res) => {
   const profile = readJSON(PROFILE_FILE, {})
   const voiceDesc = profile.totalSamples >= 3 ? buildVoiceDescription(profile) : null
   const catInfo = CATEGORIES[interviewCategory] || CATEGORIES.greeting
+  const time = timeLabel()
 
   let systemContent
   if (interviewMode) {
     systemContent = [
-      `你是說話風格採集夥伴，用情境問題讓使用者自然說話，學習他的對話風格。`,
+      `你是說話風格採集夥伴，現在是台灣${time}，用情境問題讓使用者自然說話，學習他的對話風格。`,
       `目前類別：${catInfo.label}（${catInfo.desc}）`,
-      `情境設計：要有具體對象（朋友/同事/家人/客戶）+ 場景（LINE 訊息/當面/群組），每次親密度和壓力不同。`,
-      `使用者回答後：一句台灣口語自然回應（如「哈這樣說蠻自然的」「好，換個角度」），接著馬上問下一個情境。`,
-      `規則：口語繁體中文，一次一個情境，不說「已記錄」「謝謝提供」等機械語言，保持像朋友聊天的感覺。`,
-      isStart ? `開場：一句輕鬆招呼說要練對話風格，馬上問第一個情境，不要解釋太多。` : '',
+      `情境設計原則：具體對象（朋友/同事/家人/客戶/陌生人）+ 明確場景（LINE 訊息/群組/當面/電話），每次親密度、壓力、緊迫感都不同。`,
+      `今日情境變化方向：${openingHook()}`,
+      `使用者回答後：一句台灣口語自然反應（短、口語，如「哈這樣說蠻自然的」「這個角度不錯」「我懂，但我可能會說…不對，你這樣也行」），接著馬上出下一個情境。`,
+      `禁止：「已記錄」「謝謝提供」「分析完畢」等機械感語言。保持像朋友聊天的自然節奏。`,
+      isStart ? `開場：${time === '早上' ? '早上好，' : time === '深夜' ? '還沒睡啊，' : ''}一句輕鬆搭話，馬上出第一個情境，不要解釋今天要做什麼。` : '',
     ].filter(Boolean).join('\n')
   } else {
     systemContent = [
@@ -741,22 +857,39 @@ app.post('/api/assistant/chat/stream', async (req, res) => {
   await streamToClient(res, provider, chatMsgs, 200)
 })
 
+// Style scenario seeds — rotate so each session uses a different angle
+const STYLE_SCENARIO_SEEDS = [
+  '情境以「熟識但許久沒聯絡」為主軸，難度中等。',
+  '情境以「初次認識或剛加朋友」為主軸，使用者需要建立好感。',
+  '情境以「關係親密的好友」為主軸，可以輕鬆隨性。',
+  '情境以「職場/半正式關係」為主軸，需要拿捏分寸。',
+  '情境包含一點小尷尬或誤會，使用者要用風格化解。',
+  '情境偏向「慶祝/好消息」類，使用者要展示風格的熱情或溫度。',
+  '情境是「對方情緒不太好」，需要展示風格的支持面。',
+  '情境混合多種對象（群組或多人），增加挑戰度。',
+]
+function styleScenarioSeed() {
+  return STYLE_SCENARIO_SEEDS[Math.floor(Date.now() / 1000) % STYLE_SCENARIO_SEEDS.length]
+}
+
 app.post('/api/style/chat/stream', async (req, res) => {
   const { messages = [], userMessage, styleId, isStart = false } = req.body
   if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
 
   const style = STYLE_PRESETS[styleId]
   if (!style) return res.status(400).json({ error: 'unknown style' })
+  const time = timeLabel()
 
   const systemContent = [
-    `你是對話風格教練，幫使用者練習「${style.name}」風格。`,
-    `「${style.name}」的特色：${style.zh}`,
-    `你的工作流程：`,
-    `1. 給出一個具體的對話情境（明確對象如朋友/同事/家人 + 場景如LINE訊息/當面/群組）`,
-    `2. 使用者回應後，先用1-2句話評估他的表現（幾分/10、哪裡好、哪裡可以更到位），語氣像朋友，不說教`,
-    `3. 馬上出下一個情境`,
-    `規則：繁體中文台灣口語，評分要具體（如「老朋友感有7分！」），不要長篇大論。`,
-    isStart ? `開場：一句輕鬆說今天要練的風格，直接出第一個情境，不要廢話。` : '',
+    `你是對話風格教練，現在是台灣${time}，幫使用者練習「${style.name}」風格。`,
+    `「${style.name}」的核心：${style.zh}`,
+    `今日情境方向：${styleScenarioSeed()}`,
+    `你的節奏：`,
+    `1. 出一個具體情境（對象 + 場景 + 一句對白，像真實截圖一樣）`,
+    `2. 使用者回應後，1-2句評分：幾分/10 + 哪一個字/句最到位或最跑掉，語氣像好友不說教`,
+    `3. 馬上出下一個情境（換對象或場景，不重複）`,
+    `禁止：長篇解說、「溫馨提示」、超過3句的評語。評分要快、準、有趣。`,
+    isStart ? `開場：現在是${time}，一句進入狀態的話，直接出第一個情境（不解釋今天要練什麼）。` : '',
   ].filter(Boolean).join('\n')
 
   const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-12)]

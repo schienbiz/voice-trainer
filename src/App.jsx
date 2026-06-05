@@ -100,7 +100,8 @@ export default function App() {
   const [loading, setLoading]   = useState({ topic: false, analyze: false, export: false, assistant: false })
   const [lastAnalysis, setLastAnalysis] = useState(null)
   const [tab, setTab]           = useState('train')
-  const [templates, setTemplates] = useState(null)
+  const [templates, setTemplates] = useState(null)   // { generated, basedOnSamples, templates: { cat: [{text,applied,appliedAt}] } }
+  const [applyingTemplate, setApplyingTemplate] = useState(null)  // "cat::text" being applied
   const [feedback, setFeedback] = useState(null)
   const [listening, setListening] = useState(false)
   const [interim, setInterim] = useState('')
@@ -199,10 +200,19 @@ export default function App() {
     if (r.ok) setHistory(await r.json())
   }, [])
 
+  const fetchTemplates = useCallback(async () => {
+    const r = await fetch(`${API}/templates`)
+    if (r.ok) {
+      const data = await r.json()
+      if (data) setTemplates(data)
+    }
+  }, [])
+
   useEffect(() => {
     fetchProfile()
     fetchProviders()
     fetchHistory()
+    fetchTemplates()
     loadTopic('greeting')
   }, [])
 
@@ -269,15 +279,43 @@ export default function App() {
       const r = await fetch(`${API}/generate-templates`, { method: 'POST' })
       const data = await r.json()
       if (r.ok) {
-        setTemplates(data.templates)
+        setTemplates({ templates: data.templates, basedOnSamples: data.basedOnSamples, generated: new Date().toISOString() })
         setTab('templates')
-        const rosMsg = data.rosImported > 0 ? `，已自動匯入 ${data.rosImported} 個到 ROS 資料庫` : ''
-        setFeedback({ type: 'success', msg: `✅ 已根據 ${data.basedOnSamples} 個樣本生成 Relationship OS 模板${rosMsg}` })
+        const rosMsg = data.rosImported > 0 ? `，已自動套用 ${data.rosImported} 個到 ROS` : '（ROS 未連線，可手動套用）'
+        setFeedback({ type: 'success', msg: `✅ 已根據 ${data.basedOnSamples} 個樣本生成模板${rosMsg}` })
       } else {
         setFeedback({ type: 'error', msg: `❌ ${data.error}` })
       }
     } finally {
       setLoading(l => ({ ...l, export: false }))
+    }
+  }
+
+  async function applyTemplate(category, text) {
+    const key = `${category}::${text}`
+    setApplyingTemplate(key)
+    try {
+      const r = await fetch(`${API}/templates/apply`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ category, text }),
+      })
+      const data = await r.json()
+      if (r.ok && data.ok) {
+        setTemplates(prev => ({
+          ...prev,
+          templates: {
+            ...prev.templates,
+            [category]: prev.templates[category].map(item =>
+              item.text === text ? { ...item, applied: true, appliedAt: new Date().toISOString() } : item
+            ),
+          },
+        }))
+      } else {
+        setFeedback({ type: 'error', msg: `❌ 套用失敗：${data.error}` })
+      }
+    } finally {
+      setApplyingTemplate(null)
     }
   }
 
@@ -1251,7 +1289,7 @@ export default function App() {
           {/* ── TEMPLATES TAB ── */}
           {tab === 'templates' && (
             <div>
-              {!templates ? (
+              {!templates?.templates ? (
                 <div style={{ textAlign: 'center', padding: 40 }}>
                   <div style={{ fontSize: 32, marginBottom: 16 }}>💬</div>
                   <div style={{ color: '#888', marginBottom: 20 }}>
@@ -1263,25 +1301,91 @@ export default function App() {
                     </button>
                   )}
                 </div>
-              ) : (
-                <div>
-                  <div style={{ fontSize: 12, color: '#666', marginBottom: 16 }}>
-                    以下模板已根據你的說話風格生成，並自動同步到 Relationship OS（透過 Syncthing）
-                  </div>
-                  {Object.entries(templates).map(([cat, msgs]) => (
-                    <div key={cat} style={s.card}>
-                      <div style={{ fontSize: 14, fontWeight: 600, color: '#9d96ff', marginBottom: 10 }}>
-                        {CATEGORIES.find(c => c.id === cat)?.emoji || '💬'} {CATEGORIES.find(c => c.id === cat)?.label || cat}
-                      </div>
-                      {(msgs || []).map((msg, i) => (
-                        <div key={i} style={{ fontSize: 13, color: '#ddd', background: '#0d0d15', padding: '10px 12px', borderRadius: 8, marginBottom: 8, lineHeight: 1.6 }}>
-                          {msg}
+              ) : (() => {
+                // Flatten all templates into { cat, item } pairs, split by applied state
+                const allItems = Object.entries(templates.templates).flatMap(([cat, items]) =>
+                  (items || []).map(item => ({ cat, item: typeof item === 'string' ? { text: item, applied: false } : item }))
+                )
+                const unapplied = allItems.filter(x => !x.item.applied)
+                const applied   = allItems.filter(x => x.item.applied)
+
+                const renderItem = ({ cat, item }) => {
+                  const catInfo = CATEGORIES.find(c => c.id === cat)
+                  const key = `${cat}::${item.text}`
+                  const isApplying = applyingTemplate === key
+                  return (
+                    <div key={key} style={{
+                      display: 'flex', alignItems: 'flex-start', gap: 10,
+                      background: item.applied ? '#0a1a0a' : '#0d0d15',
+                      border: `1px solid ${item.applied ? '#22c55e22' : '#1e1e2a'}`,
+                      borderRadius: 8, padding: '10px 12px', marginBottom: 8,
+                    }}>
+                      <div style={{ flex: 1 }}>
+                        <div style={{ fontSize: 11, color: item.applied ? '#22c55e88' : '#555', marginBottom: 4 }}>
+                          {catInfo?.emoji} {catInfo?.label || cat}
+                          {item.applied && item.appliedAt && (
+                            <span style={{ marginLeft: 8 }}>· {new Date(item.appliedAt).toLocaleDateString('zh-TW')}</span>
+                          )}
                         </div>
-                      ))}
+                        <div style={{ fontSize: 13, color: item.applied ? '#aaa' : '#ddd', lineHeight: 1.6 }}>
+                          {item.text}
+                        </div>
+                      </div>
+                      {item.applied ? (
+                        <span style={{ fontSize: 11, color: '#22c55e', whiteSpace: 'nowrap', paddingTop: 2, flexShrink: 0 }}>✓ 已套用</span>
+                      ) : (
+                        <button
+                          onClick={() => applyTemplate(cat, item.text)}
+                          disabled={!!applyingTemplate}
+                          style={{
+                            padding: '4px 10px', borderRadius: 6, border: 'none', fontSize: 12, cursor: 'pointer', flexShrink: 0,
+                            background: isApplying ? '#1e1e2a' : '#6c63ff22',
+                            color: isApplying ? '#555' : '#9d96ff',
+                            outline: '1px solid #6c63ff33',
+                          }}
+                        >
+                          {isApplying ? '套用中…' : '套用 ROS'}
+                        </button>
+                      )}
                     </div>
-                  ))}
-                </div>
-              )}
+                  )
+                }
+
+                return (
+                  <div>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+                      <div style={{ fontSize: 12, color: '#555' }}>
+                        基於 {templates.basedOnSamples} 個樣本 ·
+                        {applied.length}/{allItems.length} 個已套用到 ROS
+                      </div>
+                      <button style={{ ...s.btn('secondary'), fontSize: 12, padding: '6px 12px' }}
+                        onClick={generateTemplates} disabled={loading.export || !readyForExport}>
+                        {loading.export ? '生成中…' : '🔄 重新生成'}
+                      </button>
+                    </div>
+
+                    {unapplied.length > 0 && (
+                      <div style={{ marginBottom: 24 }}>
+                        <div style={{ fontSize: 12, color: '#f59e0b', fontWeight: 600, marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#f59e0b', display: 'inline-block' }} />
+                          未套用（{unapplied.length} 個）
+                        </div>
+                        {unapplied.map(renderItem)}
+                      </div>
+                    )}
+
+                    {applied.length > 0 && (
+                      <div>
+                        <div style={{ fontSize: 12, color: '#22c55e88', fontWeight: 600, marginBottom: 10, display: 'flex', alignItems: 'center', gap: 6 }}>
+                          <span style={{ width: 7, height: 7, borderRadius: '50%', background: '#22c55e', display: 'inline-block' }} />
+                          已套用到 Relationship OS（{applied.length} 個）
+                        </div>
+                        {applied.map(renderItem)}
+                      </div>
+                    )}
+                  </div>
+                )
+              })()}
             </div>
           )}
         </div>
