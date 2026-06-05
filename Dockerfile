@@ -10,13 +10,14 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# CockroachDB cluster CA cert — required for SSL verification on Linux.
-# Non-fatal: if the cert URL changes or is unreachable, the build still succeeds.
-# The server falls back to Node.js built-in CAs, which usually work with CockroachDB Serverless.
+# CockroachDB cluster CA cert — best-effort; build succeeds even if unreachable.
+# --max-time 10 prevents the build from hanging if the URL is slow/unreachable.
 RUN mkdir -p /root/.postgresql && \
-    curl -fsSL -o /root/.postgresql/root.crt \
-    'https://cockroachlabs.cloud/clusters/72abce99-7095-4c7f-9ed1-278a7c309471/cert' \
-    || echo "[docker] CockroachDB cert download skipped — using system CAs"
+    curl -fsSL --max-time 10 --connect-timeout 5 \
+      -o /root/.postgresql/root.crt \
+      'https://cockroachlabs.cloud/clusters/72abce99-7095-4c7f-9ed1-278a7c309471/cert' \
+    && echo "[docker] CockroachDB cert downloaded OK" \
+    || echo "[docker] CockroachDB cert skipped — using Node.js built-in CAs"
 
 # Empty defaults — DB is source of truth; server restores data on startup.
 RUN mkdir -p data && \
