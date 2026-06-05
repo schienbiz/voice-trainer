@@ -81,7 +81,7 @@ const PROVIDERS = [
     name: 'Groq-Llama',
     key: process.env.VOICE_GROQ_API_KEY,
     baseURL: 'https://api.groq.com/openai/v1',
-    model: 'llama-3.3-70b-versatile',
+    model: 'meta-llama/llama-4-scout-17b-16e-instruct',
     timeout: 8_000,
   },
   {
@@ -107,10 +107,10 @@ const PROVIDERS = [
     timeout: 30_000,
   },
   {
-    name: 'OpenRouter',
+    name: 'Nemotron',
     key: process.env.VOICE_OPENROUTER_API_KEY,
     baseURL: 'https://openrouter.ai/api/v1',
-    model: 'openai/gpt-oss-120b:free',
+    model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
     timeout: 20_000,
   },
   // Ollama (optional local — activate by running: ollama pull qwen2.5:7b)
