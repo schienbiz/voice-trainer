@@ -755,20 +755,19 @@ function timeLabel() {
   return '夜晚'
 }
 
-// 8 opening hooks — rotate by second so each session feels different
 const OPENING_HOOKS = [
-  '開場時先說一句輕鬆的廢話（天氣/今天怎樣/最近在忙啥），讓對話感覺像真實對話才開始情境。',
   '直接丟一個很生活的具體情境，不廢話，像突然傳訊息給朋友一樣。',
   '開場帶一點懸念：先描述情況的「問題」，讓使用者想幫忙解決。',
   '以角色扮演方式開場：你是他的朋友，突然傳了一則訊息，讓他回應。',
-  '先分享一件你（AI）剛經歷的小事，再問他遇到類似情況怎麼說。',
-  '用一個反問開場：「如果你的同事這樣說你會怎麼回？」直接給對話截圖文字。',
-  '帶出一個多人情境（群組/聚會），讓他的回覆對象更明確有趣。',
+  '先分享一件你剛看到或剛發生的小事，自然帶出情境。',
+  '用一個反問開場：給一段對話截圖文字，問他會怎麼回。',
+  '帶出一個多人情境（群組/聚會），讓回覆對象更明確有趣。',
   '從一個真實場景出發（捷運上/咖啡廳/公司茶水間），讓情境立體。',
+  '丟一個有點小尷尬的情況，讓使用者自然化解。',
 ]
 
 function openingHook() {
-  return OPENING_HOOKS[Math.floor(Date.now() / 1000) % OPENING_HOOKS.length]
+  return OPENING_HOOKS[Math.floor(Math.random() * OPENING_HOOKS.length)]
 }
 
 // ── SSE streaming helper ─────────────────────────────────────────────────────
@@ -831,13 +830,13 @@ app.post('/api/assistant/chat/stream', async (req, res) => {
   let systemContent
   if (interviewMode) {
     systemContent = [
-      `你是說話風格採集夥伴，現在是台灣${time}，用情境問題讓使用者自然說話，學習他的對話風格。`,
-      `目前類別：${catInfo.label}（${catInfo.desc}）`,
-      `情境設計原則：具體對象（朋友/同事/家人/客戶/陌生人）+ 明確場景（LINE 訊息/群組/當面/電話），每次親密度、壓力、緊迫感都不同。`,
-      `今日情境變化方向：${openingHook()}`,
-      `使用者回答後：一句台灣口語自然反應（短、口語，如「哈這樣說蠻自然的」「這個角度不錯」「我懂，但我可能會說…不對，你這樣也行」），接著馬上出下一個情境。`,
-      `禁止：「已記錄」「謝謝提供」「分析完畢」等機械感語言。保持像朋友聊天的自然節奏。`,
-      isStart ? `開場：${time === '早上' ? '早上好，' : time === '深夜' ? '還沒睡啊，' : ''}一句輕鬆搭話，馬上出第一個情境，不要解釋今天要做什麼。` : '',
+      `你是一個正在幫朋友練「${catInfo.label}」對話感的人，現在台灣${time}。不是老師，不是助理，就是朋友。`,
+      `每輪：丟一個有具體對象和生活感的情境 → 使用者回應 → 用最自然的方式接話。`,
+      `接話方式隨情況變：有時一個字（「哈」「誒」「真的假的」），有時一句疑問，有時感想，有時直接帶下一個情境，不要每輪都一樣節奏。`,
+      `情境要有點情緒張力：不要每次都「朋友叫你吃飯」這種零壓力情境，偶爾加點小尷尬、小誤會、或需要表態的時刻。`,
+      `今日情境方向：${openingHook()}`,
+      `絕對禁止：「已記錄」「謝謝分享」「這個不錯」「換下一題」或任何讓人感覺在填問卷的語言。`,
+      isStart ? `現在直接開始，${time === '深夜' ? '還沒睡？' : time === '早上' ? '早啊' : ''}馬上丟第一個情境，像朋友突然傳訊息那種感覺。` : '',
     ].filter(Boolean).join('\n')
   } else {
     systemContent = [
@@ -848,13 +847,17 @@ app.post('/api/assistant/chat/stream', async (req, res) => {
   }
 
   const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-10)]
-  if (isStart) chatMsgs.push({ role: 'user', content: '準備好了，請開始！' })
-  else if (userMessage) chatMsgs.push({ role: 'user', content: userMessage })
+  if (isStart) {
+    const starters = ['嘿', '哈囉', '來了', '好', '開始']
+    chatMsgs.push({ role: 'user', content: starters[Math.floor(Math.random() * starters.length)] })
+  } else if (userMessage) {
+    chatMsgs.push({ role: 'user', content: userMessage })
+  }
 
   const provider = pickFastProvider()
   if (!provider) return res.status(503).json({ error: 'no providers available' })
 
-  await streamToClient(res, provider, chatMsgs, 200)
+  await streamToClient(res, provider, chatMsgs, 280)
 })
 
 // Style scenario seeds — rotate so each session uses a different angle
@@ -869,7 +872,7 @@ const STYLE_SCENARIO_SEEDS = [
   '情境混合多種對象（群組或多人），增加挑戰度。',
 ]
 function styleScenarioSeed() {
-  return STYLE_SCENARIO_SEEDS[Math.floor(Date.now() / 1000) % STYLE_SCENARIO_SEEDS.length]
+  return STYLE_SCENARIO_SEEDS[Math.floor(Math.random() * STYLE_SCENARIO_SEEDS.length)]
 }
 
 app.post('/api/style/chat/stream', async (req, res) => {
@@ -881,20 +884,22 @@ app.post('/api/style/chat/stream', async (req, res) => {
   const time = timeLabel()
 
   const systemContent = [
-    `你是對話風格教練，現在是台灣${time}，幫使用者練習「${style.name}」風格。`,
-    `「${style.name}」的核心：${style.zh}`,
+    `你是陪人練「${style.name}」對話感的朋友，現在台灣${time}。`,
+    `「${style.name}」的核心感覺：${style.zh}`,
     `今日情境方向：${styleScenarioSeed()}`,
-    `你的節奏：`,
-    `1. 出一個具體情境（對象 + 場景 + 一句對白，像真實截圖一樣）`,
-    `2. 使用者回應後，1-2句評分：幾分/10 + 哪一個字/句最到位或最跑掉，語氣像好友不說教`,
-    `3. 馬上出下一個情境（換對象或場景，不重複）`,
-    `禁止：長篇解說、「溫馨提示」、超過3句的評語。評分要快、準、有趣。`,
-    isStart ? `開場：現在是${time}，一句進入狀態的話，直接出第一個情境（不解釋今天要練什麼）。` : '',
+    `每輪節奏：丟一個具體情境（對象 + 場景 + 一句觸發對白）→ 使用者回應 → 用最自然的方式接（可能是「欸這句很到位」「好像少了一點什麼」「哈哈這樣也行」）→ 帶下一個情境。`,
+    `偶爾可以指出最傳神的那個字或句子，但不要每次都評分，對話要有呼吸感，不是考試。`,
+    `禁止：「幾分/10」「溫馨提示」「很好很好」「繼續加油」等教學感語言。`,
+    isStart ? `現在直接出第一個情境，不用介紹今天要練什麼。` : '',
   ].filter(Boolean).join('\n')
 
   const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-12)]
-  if (isStart) chatMsgs.push({ role: 'user', content: '開始！' })
-  else if (userMessage) chatMsgs.push({ role: 'user', content: userMessage })
+  if (isStart) {
+    const starters = ['來', '好', '嘿', '開始', '哈囉']
+    chatMsgs.push({ role: 'user', content: starters[Math.floor(Math.random() * starters.length)] })
+  } else if (userMessage) {
+    chatMsgs.push({ role: 'user', content: userMessage })
+  }
 
   const provider = pickFastProvider()
   if (!provider) return res.status(503).json({ error: 'no providers available' })
