@@ -7,6 +7,7 @@ import OpenAI from 'openai'
 import dotenv from 'dotenv'
 import pkg from 'pg'
 import { homedir } from 'os'
+import rateLimit from 'express-rate-limit'
 const { Pool } = pkg
 
 dotenv.config()
@@ -110,7 +111,7 @@ const PROVIDERS = [
     name: 'Nemotron',
     key: process.env.VOICE_OPENROUTER_API_KEY,
     baseURL: 'https://openrouter.ai/api/v1',
-    model: 'nvidia/nemotron-3-ultra-550b-a55b:free',
+    model: 'nvidia/llama-3.1-nemotron-70b-instruct:free',
     timeout: 20_000,
   },
   // Ollama (optional local — activate by running: ollama pull qwen2.5:7b)
@@ -188,6 +189,17 @@ function readJSON(file, fallback) {
 }
 function writeJSON(file, data) {
   fs.writeFileSync(file, JSON.stringify(data, null, 2))
+}
+
+// In-memory profile cache — avoids repeated disk reads on every analyze/stream request
+let _profileCache = null
+function readProfile() {
+  if (!_profileCache) _profileCache = readJSON(PROFILE_FILE, { totalSamples: 0, tone: {}, language: {}, patterns: {}, byCategory: {} })
+  return _profileCache
+}
+function writeProfile(data) {
+  _profileCache = data
+  writeJSON(PROFILE_FILE, data)
 }
 
 // ── Topic definitions ─────────────────────────────────────────────────────────
@@ -273,9 +285,14 @@ const app = express()
 app.use(cors())
 app.use(express.json())
 
+// Per-IP rate limits — protect API keys from abuse
+const analyzeLimit = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false })
+const streamLimit  = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
+const topicLimit   = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
+
 app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer', v: 2 }))
 
-app.get('/api/topic', async (req, res) => {
+app.get('/api/topic', topicLimit, async (req, res) => {
   const category = req.query.category || 'greeting'
   const usedTopics = readJSON(path.join(DATA_DIR, 'topics-used.json'), {})
   const used = usedTopics[category] || []
@@ -437,7 +454,7 @@ function updateProfile(profile, analysis, category, userMsg, topic) {
   return profile
 }
 
-app.post('/api/analyze', async (req, res) => {
+app.post('/api/analyze', analyzeLimit, async (req, res) => {
   const { topic, response: userMsg, category, fast = false } = req.body
   if (!userMsg?.trim()) return res.status(400).json({ error: 'empty response' })
 
@@ -458,9 +475,9 @@ app.post('/api/analyze', async (req, res) => {
   }
 
   // Update voice profile
-  const profile = readJSON(PROFILE_FILE, { totalSamples: 0, tone: {}, language: {}, patterns: {}, byCategory: {} })
+  const profile = readProfile()
   const updated = updateProfile(profile, merged, category, userMsg, topic)
-  writeJSON(PROFILE_FILE, updated)
+  writeProfile(updated)
 
   // Log conversation
   const sample = { id: Date.now().toString(), category, topic, response: userMsg, analysis: merged, at: new Date().toISOString() }
@@ -481,7 +498,7 @@ app.post('/api/analyze', async (req, res) => {
 // ── API: Get profile ──────────────────────────────────────────────────────────
 
 app.get('/api/profile', (req, res) => {
-  res.json(readJSON(PROFILE_FILE, {}))
+  res.json(readProfile())
 })
 
 // ── API: History ──────────────────────────────────────────────────────────────
@@ -594,7 +611,7 @@ app.post('/api/templates/apply', async (req, res) => {
 // ── API: Generate Relationship OS templates ───────────────────────────────────
 
 app.post('/api/generate-templates', async (req, res) => {
-  const profile = readJSON(PROFILE_FILE, {})
+  const profile = readProfile()
   if (profile.totalSamples < 5) {
     return res.status(400).json({ error: `需要至少 5 個樣本才能生成模板（目前：${profile.totalSamples}）` })
   }
@@ -615,8 +632,9 @@ ${voiceDesc}
 他的真實訊息樣本：
 ${examples}
 
-請為以下類別各生成 3 個模板，每個模板用 {{contact_name}} 代替名字。
-格式：{ "greeting": ["模板1", "模板2", "模板3"], "follow_up": [...], "celebration": [...], "caring": [...], "gratitude": [...] }
+請為以下 8 個類別各生成 3 個模板，每個模板用 {{contact_name}} 代替名字。
+類別（key 必須完全一致）：greeting, celebration, caring, business, scheduling, gratitude, sharing, support
+格式：{ "greeting": ["模板1", "模板2", "模板3"], "celebration": [...], "caring": [...], "business": [...], "scheduling": [...], "gratitude": [...], "sharing": [...], "support": [...] }
 
 模板必須完全符合這個人的真實說話風格、長度、語言比例和用詞習慣。`,
     },
@@ -668,7 +686,7 @@ app.get('/api/providers', (req, res) => {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-export function buildVoiceDescription(profile) {
+function buildVoiceDescription(profile) {
   if (!profile.totalSamples) return '（尚未收集樣本）'
   const t = profile.tone || {}
   const l = profile.language || {}
@@ -690,98 +708,6 @@ ${topOpeners ? `常見開頭：「${topOpeners}」` : ''}
 ${topPhrases ? `特徵詞彙：${topPhrases}` : ''}
   `.trim()
 }
-
-// ── API: AI Assistant chat ────────────────────────────────────────────────────
-
-app.post('/api/assistant/chat', async (req, res) => {
-  const { messages = [], userMessage, interviewMode = false, interviewCategory = 'greeting', isStart = false } = req.body
-  if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
-
-  const profile = readJSON(PROFILE_FILE, {})
-  const voiceDesc = profile.totalSamples >= 3 ? buildVoiceDescription(profile) : null
-  const catInfo = CATEGORIES[interviewCategory] || CATEGORIES.greeting
-
-  let systemContent
-  if (interviewMode) {
-    const time2 = timeLabel()
-    systemContent = [
-      `現在台灣${time2}。你說話的方式：中英台語自然夾雜，有時很乾（「喔」「蛤」「齁」），有時突然很熱，講話直接，偶爾嘴賤，完全正常台灣人 LINE 感。`,
-      `今天收集朋友在「${catInfo.label}」情境下的說話方式——${catInfo.desc}。`,
-      `丟真實情境：對象要具體有細節，情緒要有點東西（不確定、尷尬、需要表態）。他回應之後，用你自己的感覺接，節奏靠感覺。`,
-      `不能有：「已記錄」「謝謝分享」「這個不錯耶」或任何問卷感語言。`,
-      isStart ? `直接開始，帶一句自然的話馬上丟第一個情境。` : '',
-    ].filter(Boolean).join('\n')
-  } else {
-    systemContent = [
-      '你是個台灣人，說話中英夾雜，LINE 聊天風格，有時很乾，有時突然很熱。',
-      voiceDesc ? `這個人說話的樣子：\n${voiceDesc}\n` : '',
-      '直接用台灣口語回覆，1-3句，不要前綴，不要說明文字。',
-    ].filter(Boolean).join('\n')
-  }
-
-  const chatMsgs = [
-    { role: 'system', content: systemContent },
-    ...messages.slice(-10),
-  ]
-
-  if (isStart) {
-    const starters = ['嘿', '哈囉', '來了', '好', '開始']
-    chatMsgs.push({ role: 'user', content: starters[Math.floor(Math.random() * starters.length)] })
-  } else if (userMessage) {
-    chatMsgs.push({ role: 'user', content: userMessage })
-  }
-
-  const fast = PROVIDERS
-    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
-    .sort((a, b) => a.timeout - b.timeout)[0] || PROVIDERS[0]
-
-  const reply = await callProvider(fast, chatMsgs, 200)
-  if (!reply) return res.status(503).json({ error: 'AI providers unavailable' })
-
-  res.json({ reply, provider: fast.name })
-})
-
-// ── API: Style practice ──────────────────────────────────────────────────────
-
-app.get('/api/styles', (req, res) => {
-  res.json(Object.entries(STYLE_PRESETS).map(([id, s]) => ({ id, name: s.name, desc: s.desc })))
-})
-
-app.post('/api/style/chat', async (req, res) => {
-  const { messages = [], userMessage, styleId, isStart = false } = req.body
-  if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
-
-  const style = STYLE_PRESETS[styleId]
-  if (!style) return res.status(400).json({ error: 'unknown style' })
-
-  const systemContent = [
-    `你是對話風格教練，幫使用者練習「${style.name}」風格。`,
-    `「${style.name}」的特色：${style.zh}`,
-    `你的工作流程：`,
-    `1. 給出一個具體的對話情境（明確對象如朋友/同事/家人 + 場景如LINE訊息/當面/群組）`,
-    `2. 使用者回應後，先用1-2句話評估他的表現（幾分/10、哪裡好、哪裡可以更到位），語氣像朋友，不說教`,
-    `3. 馬上出下一個情境`,
-    `規則：繁體中文台灣口語，評分要具體（如「老朋友感有7分！」），不要長篇大論。`,
-    isStart ? `開場：一句輕鬆說今天要練的風格，直接出第一個情境，不要廢話。` : '',
-  ].filter(Boolean).join('\n')
-
-  const chatMsgs = [
-    { role: 'system', content: systemContent },
-    ...messages.slice(-12),
-  ]
-
-  if (isStart) chatMsgs.push({ role: 'user', content: '開始！' })
-  else if (userMessage) chatMsgs.push({ role: 'user', content: userMessage })
-
-  const fast = PROVIDERS
-    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
-    .sort((a, b) => a.timeout - b.timeout)[0] || PROVIDERS[0]
-
-  const reply = await callProvider(fast, chatMsgs, 300)
-  if (!reply) return res.status(503).json({ error: 'AI providers unavailable' })
-
-  res.json({ reply, provider: fast.name })
-})
 
 // ── Conversation variety helpers ─────────────────────────────────────────────
 
@@ -858,11 +784,11 @@ function pickFastProvider() {
     .sort((a, b) => a.timeout - b.timeout)[0]
 }
 
-app.post('/api/assistant/chat/stream', async (req, res) => {
+app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
   const { messages = [], userMessage, interviewMode = false, interviewCategory = 'greeting', isStart = false } = req.body
   if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
 
-  const profile = readJSON(PROFILE_FILE, {})
+  const profile = readProfile()
   const voiceDesc = profile.totalSamples >= 3 ? buildVoiceDescription(profile) : null
   const catInfo = CATEGORIES[interviewCategory] || CATEGORIES.greeting
   const time = timeLabel()
@@ -915,7 +841,7 @@ function styleScenarioSeed() {
   return STYLE_SCENARIO_SEEDS[Math.floor(Math.random() * STYLE_SCENARIO_SEEDS.length)]
 }
 
-app.post('/api/style/chat/stream', async (req, res) => {
+app.post('/api/style/chat/stream', streamLimit, async (req, res) => {
   const { messages = [], userMessage, styleId, isStart = false } = req.body
   if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
 
@@ -1005,11 +931,11 @@ async function initNeon() {
 
     const { rows: [{ n: dbCount }] } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
     const localSamples = readJSON(CONV_FILE, [])
-    const localProfile = readJSON(PROFILE_FILE, null)
+    const localProfile = readProfile()
 
     if (dbCount === 0 && localSamples.length > 0) {
       // Local has data, DB is empty → upload to DB
-      if (localProfile) await syncProfileToNeon(localProfile)
+      if (localProfile.totalSamples) await syncProfileToNeon(localProfile)
       for (const s of localSamples) await saveSampleToNeon(s)
       console.log(`[db] uploaded ${localSamples.length} samples to DB`)
     } else if (dbCount > 0 && localSamples.length === 0) {
@@ -1027,7 +953,7 @@ async function initNeon() {
         at: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at,
       }))
       writeJSON(CONV_FILE, restored)
-      if (profileRows.length > 0) writeJSON(PROFILE_FILE, profileRows[0].data)
+      if (profileRows.length > 0) writeProfile(profileRows[0].data)
       console.log(`[db] restored ${restored.length} samples from DB to local JSON`)
     } else {
       console.log(`[db] ${dbCount} samples in DB, ${localSamples.length} local — in sync`)

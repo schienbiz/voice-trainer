@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 
 const API = '/api'
 
@@ -50,12 +50,13 @@ function chip(text, count) {
   )
 }
 
-async function streamSSE(url, body, onToken, onDone, onError) {
+async function streamSSE(url, body, onToken, onDone, onError, signal) {
   try {
     const res = await fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
+      signal,
     })
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
@@ -86,7 +87,7 @@ async function streamSSE(url, body, onToken, onDone, onError) {
     if (fullText) onDone?.(fullText)
     else onError?.('empty response')
   } catch (err) {
-    onError?.(err.message)
+    if (err.name !== 'AbortError') onError?.(err.message)
   }
 }
 
@@ -103,6 +104,7 @@ export default function App() {
   const [templates, setTemplates] = useState(null)   // { generated, basedOnSamples, templates: { cat: [{text,applied,appliedAt}] } }
   const [applyingTemplate, setApplyingTemplate] = useState(null)  // "cat::text" being applied
   const [feedback, setFeedback] = useState(null)
+  const feedbackTimerRef = useRef(null)
   const [listening, setListening] = useState(false)
   const [interim, setInterim] = useState('')
   const recognitionRef = useRef(null)
@@ -141,6 +143,16 @@ export default function App() {
   const styleListeningRef = useRef(false)
   const toggleAssistantVoiceRef = useRef(null)
   const toggleStyleVoiceRef = useRef(null)
+
+  // Abort controllers for in-flight SSE streams
+  const assistantAbortRef = useRef(null)
+  const styleAbortRef = useRef(null)
+
+  const showFeedback = (fb) => {
+    clearTimeout(feedbackTimerRef.current)
+    setFeedback(fb)
+    if (fb) feedbackTimerRef.current = setTimeout(() => setFeedback(null), 5000)
+  }
 
   useEffect(() => {
     const onResize = () => setIsMobile(window.innerWidth < 768)
@@ -250,7 +262,7 @@ export default function App() {
       if (r.ok) {
         setLastAnalysis(data.analysis)
         setProfile(data.profile)
-        setFeedback({ type: 'success', msg: `✅ 樣本 #${data.profile.totalSamples} 已收集（${data.analysis.modelCount} 個 AI 同時分析）` })
+        showFeedback({ type: 'success', msg: `✅ 樣本 #${data.profile.totalSamples} 已收集（${data.analysis.modelCount} 個 AI 同時分析）` })
         fetchHistory()
 
         // Fetch coaching tip in background
@@ -265,7 +277,7 @@ export default function App() {
 
         setTimeout(() => loadTopic(category), 1500)
       } else {
-        setFeedback({ type: 'error', msg: `❌ ${data.error}` })
+        showFeedback({ type: 'error', msg: `❌ ${data.error}` })
       }
     } finally {
       setLoading(l => ({ ...l, analyze: false }))
@@ -282,9 +294,9 @@ export default function App() {
         setTemplates({ templates: data.templates, basedOnSamples: data.basedOnSamples, generated: new Date().toISOString() })
         setTab('templates')
         const rosMsg = data.rosImported > 0 ? `，已自動套用 ${data.rosImported} 個到 ROS` : '（ROS 未連線，可手動套用）'
-        setFeedback({ type: 'success', msg: `✅ 已根據 ${data.basedOnSamples} 個樣本生成模板${rosMsg}` })
+        showFeedback({ type: 'success', msg: `✅ 已根據 ${data.basedOnSamples} 個樣本生成模板${rosMsg}` })
       } else {
-        setFeedback({ type: 'error', msg: `❌ ${data.error}` })
+        showFeedback({ type: 'error', msg: `❌ ${data.error}` })
       }
     } finally {
       setLoading(l => ({ ...l, export: false }))
@@ -312,7 +324,7 @@ export default function App() {
           },
         }))
       } else {
-        setFeedback({ type: 'error', msg: `❌ 套用失敗：${data.error}` })
+        showFeedback({ type: 'error', msg: `❌ 套用失敗：${data.error}` })
       }
     } finally {
       setApplyingTemplate(null)
@@ -411,6 +423,11 @@ export default function App() {
       return c < b ? cat : best
     })
 
+    // Abort any previous stream before starting a new one
+    assistantAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    assistantAbortRef.current = ctrl
+
     // Add user message + empty streaming placeholder in one update
     setChatHistory(h => [...h,
       { role: 'user', content: msg, saving: true, id: msgId, catLabel: catForMsg.label },
@@ -434,7 +451,8 @@ export default function App() {
       () => {
         setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: '⚠️ 連線失敗，請重試', streaming: false } : m))
         setLoading(l => ({ ...l, assistant: false }))
-      }
+      },
+      ctrl.signal,
     )
 
     // Parallel fast analyze (fire-and-forget)
@@ -452,6 +470,10 @@ export default function App() {
 
   function startInterview() {
     if (loading.assistant) return
+    assistantAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    assistantAbortRef.current = ctrl
+
     setSessionCatCounts({})
     const firstCat = CATEGORIES.reduce((best, cat) => {
       const b = profile?.byCategory?.[best.id]?.samples || 0
@@ -477,11 +499,16 @@ export default function App() {
       () => {
         setChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'start' }])
         setLoading(l => ({ ...l, assistant: false }))
-      }
+      },
+      ctrl.signal,
     )
   }
 
   function startStyleChat(style) {
+    styleAbortRef.current?.abort()
+    const ctrl = new AbortController()
+    styleAbortRef.current = ctrl
+
     setSelectedStyle(style)
     styleInputRef.current = ''
     setStyleInput('')
@@ -504,7 +531,8 @@ export default function App() {
       () => {
         setStyleChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'style-start-err' }])
         setStyleLoading(false)
-      }
+      },
+      ctrl.signal,
     )
   }
 
@@ -518,6 +546,10 @@ export default function App() {
     const msgId = Date.now().toString()
     const streamId = msgId + '-ai'
     const historySnap = styleChatHistory.map(({ role, content }) => ({ role, content }))
+
+    styleAbortRef.current?.abort()
+    const styleCtrl = new AbortController()
+    styleAbortRef.current = styleCtrl
 
     setStyleChatHistory(h => [...h,
       { role: 'user', content: msg, id: msgId },
@@ -540,7 +572,8 @@ export default function App() {
       () => {
         setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: '⚠️ 連線失敗，請重試', streaming: false } : m))
         setStyleLoading(false)
-      }
+      },
+      styleCtrl.signal,
     )
   }
 
@@ -586,13 +619,15 @@ export default function App() {
 
   const totalSamples = profile?.totalSamples || 0
   const readyForExport = totalSamples >= 5
-  const sessionSamples = Object.values(sessionCatCounts).reduce((s, c) => s + c, 0)
-  // Smart category: pick the one with fewest (profile + session) samples
-  const interviewCategory = CATEGORIES.reduce((best, cat) => {
+  const sessionSamples = useMemo(
+    () => Object.values(sessionCatCounts).reduce((s, c) => s + c, 0),
+    [sessionCatCounts],
+  )
+  const interviewCategory = useMemo(() => CATEGORIES.reduce((best, cat) => {
     const b = (profile?.byCategory?.[best.id]?.samples || 0) + (sessionCatCounts[best.id] || 0)
     const c = (profile?.byCategory?.[cat.id]?.samples  || 0) + (sessionCatCounts[cat.id]  || 0)
     return c < b ? cat : best
-  })
+  }), [profile, sessionCatCounts])
 
   // Keep refs current (all mutated each render so closures never go stale)
   sendAssistantRef.current = sendToAssistant
@@ -885,7 +920,7 @@ export default function App() {
                       outline: autoMicEnabled ? '1px solid #22c55e44' : 'none',
                     }}
                   >
-                    {autoMicEnabled ? '🔄 自動接麥' : '🔄 手動'}
+                    {autoMicEnabled ? '🔄 關閉自動接麥' : '🔄 開啟自動接麥'}
                   </button>
                   <button
                     onClick={startInterview}
@@ -1073,7 +1108,7 @@ export default function App() {
                           outline: autoMicEnabled ? '1px solid #22c55e44' : 'none',
                         }}
                       >
-                        {autoMicEnabled ? '🔄 自動接麥' : '🔄 手動'}
+                        {autoMicEnabled ? '🔄 關閉自動接麥' : '🔄 開啟自動接麥'}
                       </button>
                       <button
                         onClick={() => startStyleChat(selectedStyle)}
@@ -1178,7 +1213,13 @@ export default function App() {
           )}
 
           {/* ── PROFILE TAB ── */}
-          {tab === 'profile' && profile && (
+          {tab === 'profile' && !totalSamples && (
+            <div style={{ textAlign: 'center', padding: 40 }}>
+              <div style={{ fontSize: 32, marginBottom: 16 }}>🧬</div>
+              <div style={{ color: '#666' }}>還沒有樣本。先到「🎙 收集訓練」或「🤖 AI 助手」回答幾個題目吧！</div>
+            </div>
+          )}
+          {tab === 'profile' && !!totalSamples && profile && (
             <div>
               <div style={s.card}>
                 <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>🧬 你的說話風格基因</div>
