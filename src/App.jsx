@@ -492,7 +492,7 @@ export default function App() {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ messages, sessionSamples: samplesCount }),
     }).then(r => r.json()).then(data => {
-      if (data.memory) setMemories(prev => [...prev, data.memory].slice(-10))
+      if (data.memory) setMemories(prev => [...prev, data.memory].slice(-20))
     }).catch(() => {})
   }
 

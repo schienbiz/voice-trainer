@@ -782,7 +782,7 @@ id 只能用：greeting, celebration, caring, business, scheduling, gratitude, s
 
   const memories = readMemories()
   memories.push(memory)
-  if (memories.length > 10) memories.splice(0, memories.length - 10)
+  if (memories.length > 20) memories.splice(0, memories.length - 20)
   writeMemories(memories)
   console.log(`[voice] session memory saved: ${memory.insight.slice(0, 60)}`)
 
@@ -901,7 +901,7 @@ app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
   let systemContent
   if (interviewMode) {
     const weaknessReport = buildWeaknessReport(profile)
-    const recentMemories = readMemories().slice(-3)
+    const recentMemories = readMemories().slice(-8)
     systemContent = [
       `現在台灣${time}。你說話的方式：中英台語自然夾雜，有時很乾（「喔」「蛤」「齁」「哦」），有時突然很熱，講話直接，偶爾嘴賤，完全正常台灣人 LINE 感。`,
       `今天要收集朋友在「${catInfo.label}」情境下的說話方式——${catInfo.desc}。`,
