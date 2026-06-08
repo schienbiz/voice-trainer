@@ -136,6 +136,8 @@ export default function App() {
   const styleRecRef = useRef(null)
   const styleChatEndRef = useRef(null)
 
+  const [memories, setMemories] = useState([])
+
   // Auto-mic (hands-free mode)
   const [autoMicEnabled, setAutoMicEnabled] = useState(false)
   const autoMicRef = useRef(false)
@@ -177,11 +179,18 @@ export default function App() {
     styleChatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [styleChatHistory])
 
-  // Auto-start interview when entering 助手 tab
+  const prevTabRef = useRef('train')
+
+  // Auto-start interview when entering 助手 tab; save memory when leaving
   useEffect(() => {
+    if (prevTabRef.current === 'assistant' && tab !== 'assistant') {
+      saveSessionMemory(chatHistory, sessionSamples)
+    }
+    prevTabRef.current = tab
     if (tab === 'assistant' && chatHistory.length === 0 && !loading.assistant) {
       startInterview()
     }
+    if (tab === 'profile') fetchMemories()
   }, [tab])
 
   const speak = useCallback((text, onEnd) => {
@@ -220,11 +229,17 @@ export default function App() {
     }
   }, [])
 
+  const fetchMemories = useCallback(async () => {
+    const r = await fetch(`${API}/session/memories`)
+    if (r.ok) setMemories(await r.json())
+  }, [])
+
   useEffect(() => {
     fetchProfile()
     fetchProviders()
     fetchHistory()
     fetchTemplates()
+    fetchMemories()
     loadTopic('greeting')
   }, [])
 
@@ -468,8 +483,23 @@ export default function App() {
     })
   }
 
+  function saveSessionMemory(history, samplesCount) {
+    const userMsgs = history.filter(m => m.role === 'user' && m.content?.trim())
+    if (userMsgs.length < 2) return
+    const messages = history.map(({ role, content }) => ({ role, content: content || '' }))
+    fetch(`${API}/session/end`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ messages, sessionSamples: samplesCount }),
+    }).then(r => r.json()).then(data => {
+      if (data.memory) setMemories(prev => [...prev, data.memory].slice(-10))
+    }).catch(() => {})
+  }
+
   function startInterview() {
     if (loading.assistant) return
+    // Save current session memory before resetting
+    if (chatHistory.length > 0) saveSessionMemory(chatHistory, sessionSamples)
     assistantAbortRef.current?.abort()
     const ctrl = new AbortController()
     assistantAbortRef.current = ctrl
@@ -1294,6 +1324,39 @@ export default function App() {
                   )
                 })}
               </div>
+
+              {memories.length > 0 && (
+                <div style={s.card}>
+                  <div style={{ fontSize: 14, fontWeight: 600, marginBottom: 12 }}>🧠 跨場次記憶</div>
+                  {[...memories].reverse().map((m, i) => (
+                    <div key={i} style={{ background: '#0d0d15', borderRadius: 8, padding: '10px 12px', marginBottom: 8 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+                        <span style={{ fontSize: 11, color: '#555' }}>{new Date(m.at).toLocaleString('zh-TW')}</span>
+                        <span style={{ fontSize: 11, color: '#444' }}>{m.sessionLength} 輪對話</span>
+                      </div>
+                      <div style={{ fontSize: 13, color: '#bbb', lineHeight: 1.6, marginBottom: 6 }}>{m.insight}</div>
+                      <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                        {m.focusNext?.map(id => {
+                          const cat = CATEGORIES.find(c => c.id === id)
+                          return cat ? (
+                            <span key={id} style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: '#6c63ff22', color: '#9d96ff', border: '1px solid #6c63ff33' }}>
+                              補 {cat.emoji}{cat.label}
+                            </span>
+                          ) : null
+                        })}
+                        {m.strong?.map(id => {
+                          const cat = CATEGORIES.find(c => c.id === id)
+                          return cat ? (
+                            <span key={id} style={{ fontSize: 11, padding: '2px 8px', borderRadius: 10, background: '#22c55e22', color: '#86efac', border: '1px solid #22c55e33' }}>
+                              強 {cat.emoji}{cat.label}
+                            </span>
+                          ) : null
+                        })}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
             </div>
           )}
 

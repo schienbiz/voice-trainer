@@ -511,6 +511,34 @@ app.get('/api/history', (req, res) => {
   res.json(filtered.slice(0, limit))
 })
 
+// ── Session memory ─────────────────────────────────────────────────────────────
+
+const MEMORIES_FILE = path.join(DATA_DIR, 'session-memories.json')
+
+function readMemories() {
+  return readJSON(MEMORIES_FILE, [])
+}
+
+function writeMemories(memories) {
+  writeJSON(MEMORIES_FILE, memories)
+}
+
+function buildWeaknessReport(profile) {
+  if (!profile || profile.totalSamples < 3) return null
+  const catList = Object.entries(CATEGORIES).map(([id, info]) => ({
+    id, label: info.label, n: profile.byCategory?.[id]?.samples || 0,
+  }))
+  const weakCats = catList.filter(c => c.n < 5).sort((a, b) => a.n - b.n)
+  const tone = profile.tone || {}
+  const weakTones = []
+  if ((tone.humor || 0) < 0.25) weakTones.push('幽默感（偏低）')
+  if ((tone.warmth || 0) < 0.35) weakTones.push('溫暖感（偏低）')
+  const lines = []
+  if (weakCats.length > 0) lines.push(`樣本少的類別（重點補）：${weakCats.slice(0, 3).map(c => `${c.label}${c.n}個`).join('、')}`)
+  if (weakTones.length > 0) lines.push(`目前指標偏低：${weakTones.join('、')} → 可多創造這類情境`)
+  return lines.length > 0 ? lines.join('\n') : null
+}
+
 // ── Template helpers ──────────────────────────────────────────────────────────
 
 const TMPL_FILE = path.join(DATA_DIR, 'templates.json')
@@ -684,6 +712,83 @@ app.get('/api/providers', (req, res) => {
   })))
 })
 
+// ── API: Get session memories ─────────────────────────────────────────────────
+
+app.get('/api/session/memories', (req, res) => {
+  res.json(readMemories())
+})
+
+// ── API: End session — generate qualitative memory ────────────────────────────
+
+app.post('/api/session/end', async (req, res) => {
+  const { messages = [], sessionSamples = 0 } = req.body
+  const userMsgs = messages.filter(m => m.role === 'user' && m.content?.trim())
+  if (userMsgs.length < 2) return res.json({ ok: true, skipped: true })
+
+  const convText = messages
+    .filter(m => m.content?.trim())
+    .slice(-24)
+    .map(m => `${m.role === 'user' ? 'U' : 'AI'}：${m.content.slice(0, 120)}`)
+    .join('\n')
+
+  const profile = readProfile()
+  const catStats = Object.entries(CATEGORIES)
+    .map(([id, info]) => `${info.label}：${profile.byCategory?.[id]?.samples || 0}個`)
+    .join('、')
+
+  const memPrompt = [
+    {
+      role: 'system',
+      content: '你是說話風格觀察員。根據對話分析使用者的說話特徵，輸出純 JSON，不要說明文字。',
+    },
+    {
+      role: 'user',
+      content: `這是一段對話練習（${userMsgs.length} 輪，本次收集 ${sessionSamples} 個樣本）：
+
+${convText}
+
+目前各類別樣本數：${catStats}
+
+輸出 JSON：
+{
+  "insight": "50字內具體觀察這個人的說話特徵或習慣（非泛泛而談，要有具體模式）",
+  "focusNext": ["下次重點收集的1-2個類別id"],
+  "strong": ["表現自然的1-2個類別id"]
+}
+
+id 只能用：greeting, celebration, caring, business, scheduling, gratitude, sharing, support`,
+    },
+  ]
+
+  const provider = pickFastProvider()
+  const raw = provider ? await callProvider(provider, memPrompt, 300) : null
+  if (!raw) return res.json({ ok: true, skipped: true })
+
+  let parsed
+  try {
+    const match = raw.match(/\{[\s\S]*\}/)
+    if (match) parsed = JSON.parse(match[0])
+  } catch { /* ignore */ }
+
+  if (!parsed?.insight) return res.json({ ok: true, skipped: true })
+
+  const memory = {
+    at: new Date().toISOString(),
+    insight: parsed.insight,
+    focusNext: Array.isArray(parsed.focusNext) ? parsed.focusNext : [],
+    strong: Array.isArray(parsed.strong) ? parsed.strong : [],
+    sessionLength: userMsgs.length,
+  }
+
+  const memories = readMemories()
+  memories.push(memory)
+  if (memories.length > 10) memories.splice(0, memories.length - 10)
+  writeMemories(memories)
+  console.log(`[voice] session memory saved: ${memory.insight.slice(0, 60)}`)
+
+  res.json({ ok: true, memory })
+})
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function buildVoiceDescription(profile) {
@@ -795,10 +900,14 @@ app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
 
   let systemContent
   if (interviewMode) {
+    const weaknessReport = buildWeaknessReport(profile)
+    const recentMemories = readMemories().slice(-3)
     systemContent = [
       `現在台灣${time}。你說話的方式：中英台語自然夾雜，有時很乾（「喔」「蛤」「齁」「哦」），有時突然很熱，講話直接，偶爾嘴賤，完全正常台灣人 LINE 感。`,
       `今天要收集朋友在「${catInfo.label}」情境下的說話方式——${catInfo.desc}。`,
-      `丟真實情境讓他說話。情境要有人味：對象要具體有細節（不只說「朋友」——說「你那個最近在找工作的朋友」「你爸」「一個很久沒聯絡但突然傳你訊息的人」「你喜歡過的人」），情緒要有點東西（不確定、有點尷尬、開心但想裝淡定、需要表態但不知道怎麼說）。`,
+      weaknessReport ? `\n根據目前 ${profile.totalSamples} 個樣本分析：\n${weaknessReport}` : '',
+      recentMemories.length > 0 ? `\n過去幾次練習觀察到的特徵：\n${recentMemories.map(m => `• ${m.insight}`).join('\n')}\n你可以根據這些觀察，今天特別製造情境讓他練習不自然的地方。` : '',
+      `\n丟真實情境讓他說話。情境要有人味：對象要具體有細節（不只說「朋友」——說「你那個最近在找工作的朋友」「你爸」「一個很久沒聯絡但突然傳你訊息的人」「你喜歡過的人」），情緒要有點東西（不確定、有點尷尬、開心但想裝淡定、需要表態但不知道怎麼說）。`,
       `他回應之後，你就像個真實的人那樣接——可能是一個字，可能是「然後呢」「蛤真的假的」，可能是你說你自己遇到這種情況會怎麼說，可能直接丟下一個情境。節奏完全靠你感覺，不要每輪都一樣。`,
       `今日方向：${openingHook()}`,
       `絕對不能有：「已記錄」「謝謝分享」「這個不錯耶」「換下一題」或任何讓人感覺在填問卷的語氣。你不是系統，你就是個在聊天的人。`,
