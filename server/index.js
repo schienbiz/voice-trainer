@@ -725,9 +725,11 @@ app.post('/api/session/end', async (req, res) => {
   const userMsgs = messages.filter(m => m.role === 'user' && m.content?.trim())
   if (userMsgs.length < 2) return res.json({ ok: true, skipped: true })
 
-  const convText = messages
-    .filter(m => m.content?.trim())
-    .slice(-24)
+  const allMsgs = messages.filter(m => m.content?.trim())
+  const convSlice = allMsgs.length <= 28
+    ? allMsgs
+    : [...allMsgs.slice(0, 4), ...allMsgs.slice(-24)]
+  const convText = convSlice
     .map(m => `${m.role === 'user' ? 'U' : 'AI'}：${m.content.slice(0, 120)}`)
     .join('\n')
 
@@ -760,8 +762,7 @@ id 只能用：greeting, celebration, caring, business, scheduling, gratitude, s
     },
   ]
 
-  const provider = pickFastProvider()
-  const raw = provider ? await callProvider(provider, memPrompt, 300) : null
+  const raw = await callProviderFallback(memPrompt, 380)
   if (!raw) return res.json({ ok: true, skipped: true })
 
   let parsed
@@ -778,6 +779,7 @@ id 只能用：greeting, celebration, caring, business, scheduling, gratitude, s
     focusNext: Array.isArray(parsed.focusNext) ? parsed.focusNext : [],
     strong: Array.isArray(parsed.strong) ? parsed.strong : [],
     sessionLength: userMsgs.length,
+    sessionSamples,
   }
 
   const memories = readMemories()
@@ -889,6 +891,17 @@ function pickFastProvider() {
     .sort((a, b) => a.timeout - b.timeout)[0]
 }
 
+async function callProviderFallback(messages, maxTokens) {
+  const candidates = PROVIDERS
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama' && p.name !== 'Groq-Qwen3')
+    .sort((a, b) => a.timeout - b.timeout)
+  for (const p of candidates) {
+    const result = await callProvider(p, messages, maxTokens)
+    if (result) return result
+  }
+  return null
+}
+
 app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
   const { messages = [], userMessage, interviewMode = false, interviewCategory = 'greeting', isStart = false } = req.body
   if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
@@ -906,7 +919,12 @@ app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
       `現在台灣${time}。你說話的方式：中英台語自然夾雜，有時很乾（「喔」「蛤」「齁」「哦」），有時突然很熱，講話直接，偶爾嘴賤，完全正常台灣人 LINE 感。`,
       `今天要收集朋友在「${catInfo.label}」情境下的說話方式——${catInfo.desc}。`,
       weaknessReport ? `\n根據目前 ${profile.totalSamples} 個樣本分析：\n${weaknessReport}` : '',
-      recentMemories.length > 0 ? `\n過去幾次練習觀察到的特徵：\n${recentMemories.map(m => `• ${m.insight}`).join('\n')}\n你可以根據這些觀察，今天特別製造情境讓他練習不自然的地方。` : '',
+      recentMemories.length > 0 ? `\n過去幾次練習觀察到的特徵：\n${recentMemories.map(m => {
+        const parts = [`• ${m.insight}`]
+        if (m.focusNext?.length) parts.push(`  → 需加強：${m.focusNext.map(id => CATEGORIES[id]?.label || id).join('、')}`)
+        if (m.strong?.length) parts.push(`  → 表現自然：${m.strong.map(id => CATEGORIES[id]?.label || id).join('、')}`)
+        return parts.join('\n')
+      }).join('\n')}\n你可以根據這些觀察，今天特別製造情境讓他練習需加強的部分。` : '',
       `\n丟真實情境讓他說話。情境要有人味：對象要具體有細節（不只說「朋友」——說「你那個最近在找工作的朋友」「你爸」「一個很久沒聯絡但突然傳你訊息的人」「你喜歡過的人」），情緒要有點東西（不確定、有點尷尬、開心但想裝淡定、需要表態但不知道怎麼說）。`,
       `他回應之後，你就像個真實的人那樣接——可能是一個字，可能是「然後呢」「蛤真的假的」，可能是你說你自己遇到這種情況會怎麼說，可能直接丟下一個情境。節奏完全靠你感覺，不要每輪都一樣。`,
       `今日方向：${openingHook()}`,
