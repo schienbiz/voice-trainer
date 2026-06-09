@@ -64,6 +64,17 @@ async function saveSampleToNeon(sample) {
   } catch (e) { console.error('[db] sample sync error:', e.message) }
 }
 
+async function syncMemoriesToNeon(memories) {
+  if (!db) return
+  try {
+    await dbRun(
+      `INSERT INTO session_memories (id, data, updated_at) VALUES ('default', $1, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
+      [JSON.stringify(memories)]
+    )
+  } catch (e) { console.error('[db] memories sync error:', e.message) }
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT      = path.join(__dirname, '..')
 const DATA_DIR  = path.join(ROOT, 'data')
@@ -297,10 +308,8 @@ app.get('/api/topic', topicLimit, async (req, res) => {
   const usedTopics = readJSON(path.join(DATA_DIR, 'topics-used.json'), {})
   const used = usedTopics[category] || []
 
-  // Try AI generation first (Groq is fastest)
-  const groqProvider = PROVIDERS.find(p => p.name === 'Groq-Llama' && !isCooling('Groq-Llama'))
-    || PROVIDERS.find(p => p.name === 'Cerebras' && !isCooling('Cerebras'))
-  const aiTopic = groqProvider ? await callProvider(groqProvider, [
+  // Try AI generation with full provider fallback
+  const topicPrompt = [
     {
       role: 'system',
       content: `只輸出情境，不要任何前言或說明。`,
@@ -311,7 +320,8 @@ app.get('/api/topic', topicLimit, async (req, res) => {
 生成一個真實、帶點情緒張力的對話情境——對象要有細節（不只說「朋友」，說「一個好幾個月沒聯絡的朋友」「你工作上合作過但現在有點距離的人」「你爸」），情緒要有點東西（不確定怎麼說、有點在乎、需要表態但尷尬、開心但想裝淡定）。一句話直接給情境。
 已使用（避免重複）：${used.slice(-5).join(' / ') || '無'}`,
     },
-  ], 120) : null
+  ]
+  const aiTopic = await callProviderFallback(topicPrompt, 120)
 
   // Fall back to pre-built topics
   const fallbacks = FALLBACK_TOPICS[category] || FALLBACK_TOPICS.greeting
@@ -403,7 +413,7 @@ function mergeAnalyses(analyses) {
 
 function updateProfile(profile, analysis, category, userMsg, topic) {
   const n = profile.totalSamples
-  const lerp = (old, val, weight = 1) => (old * n + val * weight) / (n + weight)
+  const lerp = (old = 0, val, weight = 1) => ((old || 0) * n + val * weight) / (n + weight)
 
   // Weighted running average for numeric values
   profile.tone.formality  = lerp(profile.tone.formality,  analysis.formality)
@@ -462,9 +472,8 @@ app.post('/api/analyze', analyzeLimit, async (req, res) => {
 
   let merged
   if (fast) {
-    // Fast path: single fastest available provider (~1-2s)
-    const fp = PROVIDERS.filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama').sort((a, b) => a.timeout - b.timeout)[0]
-    const raw = fp ? await callProvider(fp, messages, 400) : null
+    // Fast path: try providers in speed order, stop at first success
+    const raw = await callProviderFallback(messages, 400)
     const analysis = parseStyleJSON(raw)
     if (!analysis) return res.status(503).json({ error: 'Analysis failed — try again' })
     merged = { ...analysis, styleNotes: analysis.styleNote ? [analysis.styleNote] : [], modelCount: 1 }
@@ -515,12 +524,16 @@ app.get('/api/history', (req, res) => {
 
 const MEMORIES_FILE = path.join(DATA_DIR, 'session-memories.json')
 
+let _memoriesCache = null
 function readMemories() {
-  return readJSON(MEMORIES_FILE, [])
+  if (!_memoriesCache) _memoriesCache = readJSON(MEMORIES_FILE, [])
+  return _memoriesCache
 }
 
 function writeMemories(memories) {
+  _memoriesCache = memories
   writeJSON(MEMORIES_FILE, memories)
+  syncMemoriesToNeon(memories).catch(() => {})
 }
 
 function buildWeaknessReport(profile) {
@@ -668,8 +681,13 @@ ${examples}
     },
   ]
 
+  // Use Groq-Qwen3 first for template generation (best instruction-following), then fallback
+  const templateCandidates = PROVIDERS
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
+    .sort((a, b) => (a.name === 'Groq-Qwen3' ? -1 : b.name === 'Groq-Qwen3' ? 1 : a.timeout - b.timeout))
+
   let rawTemplates = null
-  for (const p of PROVIDERS) {
+  for (const p of templateCandidates) {
     const raw = await callProvider(p, templatePrompt, 1000)
     if (!raw) continue
     try {
@@ -939,7 +957,7 @@ app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
     ].filter(Boolean).join('\n')
   }
 
-  const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-10)]
+  const chatMsgs = [{ role: 'system', content: systemContent }, ...messages.slice(-12)]
   if (isStart) {
     const starters = ['嘿', '哈囉', '來了', '好', '開始']
     chatMsgs.push({ role: 'user', content: starters[Math.floor(Math.random() * starters.length)] })
@@ -1054,6 +1072,12 @@ async function initNeon() {
         analysis JSONB DEFAULT '{}',
         created_at TIMESTAMPTZ DEFAULT NOW()
       )`)
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS session_memories (
+        id TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`)
     console.log('[db] schema ready')
 
     const { rows: [{ n: dbCount }] } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
@@ -1084,6 +1108,19 @@ async function initNeon() {
       console.log(`[db] restored ${restored.length} samples from DB to local JSON`)
     } else {
       console.log(`[db] ${dbCount} samples in DB, ${localSamples.length} local — in sync`)
+    }
+
+    // session_memories bidirectional sync
+    const { rows: memRows } = await dbRun('SELECT data FROM session_memories WHERE id = $1', ['default'])
+    const localMems = readJSON(MEMORIES_FILE, [])
+    if (memRows.length > 0 && localMems.length === 0) {
+      const restored = Array.isArray(memRows[0].data) ? memRows[0].data : []
+      writeJSON(MEMORIES_FILE, restored)
+      _memoriesCache = restored
+      console.log(`[db] restored ${restored.length} session memories from DB`)
+    } else if (memRows.length === 0 && localMems.length > 0) {
+      await syncMemoriesToNeon(localMems)
+      console.log(`[db] uploaded ${localMems.length} session memories to DB`)
     }
   } catch (e) { console.error('[db] init error:', e.message) }
 }
