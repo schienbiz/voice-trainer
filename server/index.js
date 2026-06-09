@@ -118,13 +118,6 @@ const PROVIDERS = [
     model: 'meta/llama-3.3-70b-instruct',
     timeout: 30_000,
   },
-  {
-    name: 'Nemotron',
-    key: process.env.VOICE_OPENROUTER_API_KEY,
-    baseURL: 'https://openrouter.ai/api/v1',
-    model: 'nvidia/llama-3.1-nemotron-70b-instruct:free',
-    timeout: 20_000,
-  },
   // Ollama (optional local — activate by running: ollama pull qwen2.5:7b)
   {
     name: 'Ollama',
