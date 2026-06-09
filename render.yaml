@@ -8,3 +8,7 @@ services:
     envVars:
       - key: NODE_ENV
         value: production
+      - key: VOICE_ROS_IMPORT_URL
+        value: https://cancel-aneurism-uneven.ngrok-free.dev
+      - key: VOICE_ROS_IMPORT_SECRET
+        value: vt-ros-311861a717e82f0d9a6c13f6
