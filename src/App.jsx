@@ -137,6 +137,8 @@ export default function App() {
   const styleChatEndRef = useRef(null)
 
   const [memories, setMemories] = useState([])
+  const [historyFilter, setHistoryFilter] = useState('all')
+  const [rebuilding, setRebuilding] = useState(false)
 
   // Auto-mic (hands-free mode)
   const [autoMicEnabled, setAutoMicEnabled] = useState(false)
@@ -217,7 +219,7 @@ export default function App() {
   }, [])
 
   const fetchHistory = useCallback(async () => {
-    const r = await fetch(`${API}/history?limit=30`)
+    const r = await fetch(`${API}/history?limit=200`)
     if (r.ok) setHistory(await r.json())
   }, [])
 
@@ -242,6 +244,25 @@ export default function App() {
     fetchMemories()
     loadTopic('greeting')
   }, [])
+
+  const deleteHistorySample = useCallback(async (id) => {
+    if (!confirm('刪除這個樣本？（不可復原）')) return
+    await fetch(`${API}/history/${id}`, { method: 'DELETE' })
+    setHistory(h => h.filter(x => x.id !== id))
+    showFeedback('已刪除。建議在風格報告頁點「重建風格報告」更新統計。')
+  }, [])
+
+  const rebuildProfile = useCallback(async () => {
+    setRebuilding(true)
+    try {
+      const r = await fetch(`${API}/profile/rebuild`, { method: 'POST' })
+      if (r.ok) {
+        await fetchProfile()
+        showFeedback('風格報告已從現有樣本重建 ✅')
+      }
+    } finally {
+      setRebuilding(false) }
+  }, [fetchProfile])
 
   async function loadTopic(cat) {
     setLoading(l => ({ ...l, topic: true }))
@@ -1252,7 +1273,12 @@ export default function App() {
           {tab === 'profile' && !!totalSamples && profile && (
             <div>
               <div style={s.card}>
-                <div style={{ fontSize: 16, fontWeight: 600, marginBottom: 4 }}>🧬 你的說話風格基因</div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 4 }}>
+                  <div style={{ fontSize: 16, fontWeight: 600 }}>🧬 你的說話風格基因</div>
+                  <button onClick={rebuildProfile} disabled={rebuilding} style={{ ...s.btn('secondary'), fontSize: 11, padding: '4px 10px' }}>
+                    {rebuilding ? '重建中…' : '🔄 重建'}
+                  </button>
+                </div>
                 <div style={{ fontSize: 13, color: '#666', marginBottom: 20 }}>
                   基於 {totalSamples} 個樣本 · 最後更新 {profile.updatedAt ? new Date(profile.updatedAt).toLocaleString('zh-TW') : '—'}
                 </div>
@@ -1363,30 +1389,57 @@ export default function App() {
           {/* ── HISTORY TAB ── */}
           {tab === 'history' && (
             <div>
-              {history.length === 0 ? (
-                <div style={{ color: '#555', textAlign: 'center', padding: 40 }}>還沒有記錄。去「收集訓練」頁面回答幾個題目吧！</div>
-              ) : history.map(h => (
-                <div key={h.id} style={{ ...s.card, marginBottom: 12 }}>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                    <span style={{ fontSize: 12, color: '#6c63ff' }}>
-                      {CATEGORIES.find(c => c.id === h.category)?.emoji} {CATEGORIES.find(c => c.id === h.category)?.label}
-                    </span>
-                    <span style={{ fontSize: 11, color: '#555' }}>{new Date(h.at).toLocaleString('zh-TW')}</span>
-                  </div>
-                  <div style={{ fontSize: 12, color: '#666', marginBottom: 6 }}>📍 {h.topic}</div>
-                  <div style={{ fontSize: 14, color: '#ddd', background: '#0d0d15', padding: '10px 12px', borderRadius: 8, lineHeight: 1.6 }}>
-                    {h.response}
-                  </div>
-                  {h.analysis && (
-                    <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
-                      <span style={{ fontSize: 11, color: '#888' }}>正式:{Math.round((h.analysis.formality||0)*100)}%</span>
-                      <span style={{ fontSize: 11, color: '#888' }}>溫暖:{Math.round((h.analysis.warmth||0)*100)}%</span>
-                      <span style={{ fontSize: 11, color: '#888' }}>中文:{Math.round((h.analysis.languageRatioZh||0)*100)}%</span>
-                      <span style={{ fontSize: 11, color: '#6c63ff' }}>{h.analysis.modelCount} 模型</span>
-                    </div>
-                  )}
+              {/* Filter + Export toolbar */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 16, flexWrap: 'wrap' }}>
+                <div style={{ display: 'flex', gap: 4, flex: 1, flexWrap: 'wrap' }}>
+                  {[['all', '全部']].concat(CATEGORIES.map(c => [c.id, `${c.emoji}${c.label}`])).map(([id, label]) => (
+                    <button key={id} onClick={() => setHistoryFilter(id)} style={{
+                      padding: '4px 10px', borderRadius: 12, border: 'none', fontSize: 11, cursor: 'pointer',
+                      background: historyFilter === id ? '#6c63ff' : '#1e1e2a',
+                      color: historyFilter === id ? '#fff' : '#888',
+                    }}>{label}</button>
+                  ))}
                 </div>
-              ))}
+                <a href={`${API}/export`} download style={{ ...s.btn('secondary'), fontSize: 11, padding: '5px 12px', textDecoration: 'none' }}>
+                  ⬇ 匯出
+                </a>
+              </div>
+
+              {(() => {
+                const filtered = historyFilter === 'all' ? history : history.filter(h => h.category === historyFilter)
+                if (filtered.length === 0) return (
+                  <div style={{ color: '#555', textAlign: 'center', padding: 40 }}>
+                    {history.length === 0 ? '還沒有記錄。去「收集訓練」頁面回答幾個題目吧！' : '這個類別還沒有記錄。'}
+                  </div>
+                )
+                return filtered.map(h => (
+                  <div key={h.id} style={{ ...s.card, marginBottom: 12 }}>
+                    <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
+                      <span style={{ fontSize: 12, color: '#6c63ff' }}>
+                        {CATEGORIES.find(c => c.id === h.category)?.emoji} {CATEGORIES.find(c => c.id === h.category)?.label}
+                      </span>
+                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                        <span style={{ fontSize: 11, color: '#555' }}>{new Date(h.at).toLocaleString('zh-TW')}</span>
+                        <button onClick={() => deleteHistorySample(h.id)} title="刪除此樣本" style={{
+                          background: 'none', border: 'none', cursor: 'pointer', color: '#444', fontSize: 13, padding: '0 2px', lineHeight: 1,
+                        }}>🗑</button>
+                      </div>
+                    </div>
+                    <div style={{ fontSize: 12, color: '#666', marginBottom: 6 }}>📍 {h.topic}</div>
+                    <div style={{ fontSize: 14, color: '#ddd', background: '#0d0d15', padding: '10px 12px', borderRadius: 8, lineHeight: 1.6 }}>
+                      {h.response}
+                    </div>
+                    {h.analysis && (
+                      <div style={{ display: 'flex', gap: 8, marginTop: 8, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 11, color: '#888' }}>正式:{Math.round((h.analysis.formality||0)*100)}%</span>
+                        <span style={{ fontSize: 11, color: '#888' }}>溫暖:{Math.round((h.analysis.warmth||0)*100)}%</span>
+                        <span style={{ fontSize: 11, color: '#888' }}>中文:{Math.round((h.analysis.languageRatioZh||0)*100)}%</span>
+                        <span style={{ fontSize: 11, color: '#6c63ff' }}>{h.analysis.modelCount} 模型</span>
+                      </div>
+                    )}
+                  </div>
+                ))
+              })()}
             </div>
           )}
 

@@ -513,11 +513,44 @@ app.get('/api/profile', (req, res) => {
 // ── API: History ──────────────────────────────────────────────────────────────
 
 app.get('/api/history', (req, res) => {
-  const all = readJSON(CONV_FILE, [])
-  const limit = parseInt(req.query.limit) || 20
+  const all = readJSON(CONV_FILE, []).filter(c => !c.deleted)
+  const limit = parseInt(req.query.limit) || 200
   const category = req.query.category
   const filtered = category ? all.filter(c => c.category === category) : all
   res.json(filtered.slice(0, limit))
+})
+
+app.delete('/api/history/:id', (req, res) => {
+  const { id } = req.params
+  const all = readJSON(CONV_FILE, [])
+  const idx = all.findIndex(c => c.id === id)
+  if (idx === -1) return res.status(404).json({ error: 'not found' })
+  all[idx].deleted = true
+  writeJSON(CONV_FILE, all)
+  console.log(`[voice] deleted sample ${id}`)
+  res.json({ ok: true })
+})
+
+app.post('/api/profile/rebuild', (req, res) => {
+  const samples = readJSON(CONV_FILE, []).filter(s => !s.deleted && s.analysis)
+  let profile = { totalSamples: 0, tone: {}, language: {}, patterns: {}, byCategory: {} }
+  for (const s of samples) {
+    const analysis = { ...s.analysis, styleNotes: s.analysis.styleNote ? [s.analysis.styleNote] : (s.analysis.styleNotes || []) }
+    profile = updateProfile(profile, analysis, s.category, s.response, s.topic)
+  }
+  writeProfile(profile)
+  syncProfileToNeon(profile).catch(() => {})
+  console.log(`[voice] profile rebuilt from ${profile.totalSamples} samples`)
+  res.json({ ok: true, totalSamples: profile.totalSamples })
+})
+
+app.get('/api/export', (req, res) => {
+  const samples = readJSON(CONV_FILE, []).filter(s => !s.deleted)
+  const profile = readProfile()
+  const payload = { exportedAt: new Date().toISOString(), totalSamples: samples.length, profile, samples }
+  res.setHeader('Content-Disposition', `attachment; filename="voice-trainer-export-${new Date().toISOString().split('T')[0]}.json"`)
+  res.setHeader('Content-Type', 'application/json')
+  res.json(payload)
 })
 
 // ── Session memory ─────────────────────────────────────────────────────────────
