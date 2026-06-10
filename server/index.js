@@ -295,6 +295,8 @@ const FALLBACK_TOPICS = {
   ],
 }
 
+const VALID_CATEGORY_IDS = new Set(Object.keys(CATEGORIES))
+
 // ── API: Get topic ───────────────────────────────────────────────────────────
 
 const app = express()
@@ -312,6 +314,7 @@ app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer', 
 
 app.get('/api/topic', topicLimit, async (req, res) => {
   const category = req.query.category || 'greeting'
+  if (!VALID_CATEGORY_IDS.has(category)) return res.status(400).json({ error: 'invalid category' })
   const usedTopics = readTopicsUsed()
   const used = usedTopics[category] || []
 
@@ -476,6 +479,8 @@ app.post('/api/analyze', analyzeLimit, async (req, res) => {
   if (!userMsg?.trim()) return res.status(400).json({ error: 'empty response' })
   if (typeof userMsg !== 'string' || userMsg.length > 1000)
     return res.status(400).json({ error: 'response too long (max 1000 chars)' })
+  if (category && !VALID_CATEGORY_IDS.has(category))
+    return res.status(400).json({ error: 'invalid category' })
 
   const messages = buildAnalyzeMessages(topic, userMsg)
 
@@ -523,7 +528,7 @@ app.get('/api/profile', (req, res) => {
 
 app.get('/api/history', (req, res) => {
   const all = readJSON(CONV_FILE, []).filter(c => !c.deleted)
-  const limit = parseInt(req.query.limit) || 200
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 200), 500)
   const category = req.query.category
   const filtered = category ? all.filter(c => c.category === category) : all
   res.json(filtered.slice(0, limit))
@@ -695,11 +700,12 @@ app.post('/api/templates/apply', async (req, res) => {
 
 app.post('/api/generate-templates', async (req, res) => {
   const profile = readProfile()
-  if (profile.totalSamples < 5) {
-    return res.status(400).json({ error: `需要至少 5 個樣本才能生成模板（目前：${profile.totalSamples}）` })
+  const cleanSamples = readJSON(CONV_FILE, []).filter(c => !c.deleted)
+  if (cleanSamples.length < 5) {
+    return res.status(400).json({ error: `需要至少 5 個樣本才能生成模板（目前：${cleanSamples.length}）` })
   }
 
-  const examples = readJSON(CONV_FILE, []).slice(0, 10).map(c => `[${c.category}] ${c.response}`).join('\n')
+  const examples = cleanSamples.slice(0, 10).map(c => `[${c.category}] ${c.response}`).join('\n')
   const voiceDesc = buildVoiceDescription(profile)
 
   const templatePrompt = [
@@ -881,7 +887,10 @@ ${topPhrases ? `特徵詞彙：${topPhrases}` : ''}
 // ── Conversation variety helpers ─────────────────────────────────────────────
 
 function timeLabel() {
-  const h = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Taipei' })).getHours()
+  const h = parseInt(
+    new Intl.DateTimeFormat('en-US', { timeZone: 'Asia/Taipei', hour: 'numeric', hour12: false }).format(new Date()),
+    10
+  )
   if (h < 6)  return '深夜'
   if (h < 11) return '早上'
   if (h < 14) return '中午'
@@ -919,6 +928,11 @@ async function streamToClient(res, provider, chatMsgs, maxTokens) {
     if (!closed && !res.writableEnded) res.write(`data: ${JSON.stringify(obj)}\n\n`)
   }
 
+  // Prevent proxy/Render from closing idle SSE connections (esp. NVIDIA 30s startup)
+  const heartbeat = setInterval(() => {
+    if (!closed && !res.writableEnded) res.write(': ping\n\n')
+  }, 15_000)
+
   try {
     const client = makeClient(provider)
     const stream = await client.chat.completions.create({
@@ -940,6 +954,7 @@ async function streamToClient(res, provider, chatMsgs, maxTokens) {
     console.warn(`[voice] ${provider.name} stream error: ${err.message?.slice(0, 60)}`)
     write({ error: 'stream interrupted' })
   } finally {
+    clearInterval(heartbeat)
     if (!res.writableEnded) {
       if (!closed) res.write('data: [DONE]\n\n')
       res.end()
@@ -1078,9 +1093,7 @@ app.post('/api/coach', coachLimit, async (req, res) => {
     },
   ]
 
-  const fast = PROVIDERS
-    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
-    .sort((a, b) => a.timeout - b.timeout)[0]
+  const fast = pickFastProvider()
 
   const tip = fast ? await callProvider(fast, coachMsgs, 80) : null
   res.json({ tip: tip?.replace(/^[「"']|[」"']$/g, '') || '很棒！繼續保持你的自然風格 👍' })
