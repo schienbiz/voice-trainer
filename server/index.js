@@ -206,6 +206,18 @@ function writeProfile(data) {
   writeJSON(PROFILE_FILE, data)
 }
 
+// In-memory cache for topics-used.json (read on every /api/topic without cache)
+const TOPICS_USED_FILE = path.join(DATA_DIR, 'topics-used.json')
+let _topicsUsedCache = null
+function readTopicsUsed() {
+  if (!_topicsUsedCache) _topicsUsedCache = readJSON(TOPICS_USED_FILE, {})
+  return _topicsUsedCache
+}
+function writeTopicsUsed(data) {
+  _topicsUsedCache = data
+  writeJSON(TOPICS_USED_FILE, data)
+}
+
 // ── Topic definitions ─────────────────────────────────────────────────────────
 
 const CATEGORIES = {
@@ -286,19 +298,21 @@ const FALLBACK_TOPICS = {
 // ── API: Get topic ───────────────────────────────────────────────────────────
 
 const app = express()
-app.use(cors())
-app.use(express.json())
+app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }))
+app.use(express.json({ limit: '64kb' }))
 
 // Per-IP rate limits — protect API keys from abuse
-const analyzeLimit = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false })
-const streamLimit  = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
-const topicLimit   = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
+const analyzeLimit  = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false })
+const streamLimit   = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
+const topicLimit    = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
+const coachLimit    = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false })
+const rebuildLimit  = rateLimit({ windowMs: 60_000, max:  3, standardHeaders: true, legacyHeaders: false })
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer', v: 2 }))
 
 app.get('/api/topic', topicLimit, async (req, res) => {
   const category = req.query.category || 'greeting'
-  const usedTopics = readJSON(path.join(DATA_DIR, 'topics-used.json'), {})
+  const usedTopics = readTopicsUsed()
   const used = usedTopics[category] || []
 
   // Try AI generation with full provider fallback
@@ -327,7 +341,7 @@ app.get('/api/topic', topicLimit, async (req, res) => {
     usedTopics[category].push(topic)
     if (usedTopics[category].length > 50) usedTopics[category] = usedTopics[category].slice(-50)
   }
-  writeJSON(path.join(DATA_DIR, 'topics-used.json'), usedTopics)
+  writeTopicsUsed(usedTopics)
 
   res.json({ topic, category, categoryInfo: CATEGORIES[category] })
 })
@@ -460,6 +474,8 @@ function updateProfile(profile, analysis, category, userMsg, topic) {
 app.post('/api/analyze', analyzeLimit, async (req, res) => {
   const { topic, response: userMsg, category, fast = false } = req.body
   if (!userMsg?.trim()) return res.status(400).json({ error: 'empty response' })
+  if (typeof userMsg !== 'string' || userMsg.length > 1000)
+    return res.status(400).json({ error: 'response too long (max 1000 chars)' })
 
   const messages = buildAnalyzeMessages(topic, userMsg)
 
@@ -524,7 +540,7 @@ app.delete('/api/history/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/profile/rebuild', (req, res) => {
+app.post('/api/profile/rebuild', rebuildLimit, (req, res) => {
   const samples = readJSON(CONV_FILE, []).filter(s => !s.deleted && s.analysis)
   let profile = { totalSamples: 0, tone: {}, language: {}, patterns: {}, byCategory: {} }
   for (const s of samples) {
@@ -766,6 +782,8 @@ app.get('/api/session/memories', (req, res) => {
 
 app.post('/api/session/end', async (req, res) => {
   const { messages = [], sessionSamples = 0 } = req.body
+  if (!Array.isArray(messages) || messages.length > 200)
+    return res.status(400).json({ error: 'invalid messages' })
   const userMsgs = messages.filter(m => m.role === 'user' && m.content?.trim())
   if (userMsgs.length < 2) return res.json({ ok: true, skipped: true })
 
@@ -1045,7 +1063,7 @@ app.post('/api/style/chat/stream', streamLimit, async (req, res) => {
 
 // ── API: Coach tip ─────────────────────────────────────────────────────────────
 
-app.post('/api/coach', async (req, res) => {
+app.post('/api/coach', coachLimit, async (req, res) => {
   const { analysis, userMsg } = req.body
   if (!analysis) return res.status(400).json({ error: 'no analysis' })
 
