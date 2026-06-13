@@ -138,6 +138,18 @@ function setCooldown(name, type = '429') {
   console.log(`[circuit] ${name} ${type === '402' ? 'credits exhausted — cooldown 24h' : 'rate-limited — cooldown 60s'}`)
 }
 
+// Ollama availability cache — probe once per 5 min to avoid 1s penalty on every analysis call
+let _ollamaOk = null, _ollamaCheckedAt = 0
+async function checkOllama(baseURL) {
+  if (Date.now() - _ollamaCheckedAt < 300_000) return _ollamaOk
+  try {
+    await fetch(`${baseURL.replace('/v1', '')}/api/tags`, { signal: AbortSignal.timeout(1_500) })
+    _ollamaOk = true
+  } catch { _ollamaOk = false }
+  _ollamaCheckedAt = Date.now()
+  return _ollamaOk
+}
+
 // Cached OpenAI clients — avoid recreating on every call
 const _clients = {}
 function makeClient(p) {
@@ -149,14 +161,7 @@ async function callProvider(p, messages, maxTokens = 512) {
   if (!p.key) return null
   if (isCooling(p.name)) return null
 
-  // Check if Ollama is available (skip if not running)
-  if (p.name === 'Ollama') {
-    try {
-      await fetch(`${p.baseURL.replace('/v1', '')}/api/tags`, { signal: AbortSignal.timeout(1000) })
-    } catch {
-      return null  // Ollama not running — skip silently
-    }
-  }
+  if (p.name === 'Ollama' && !await checkOllama(p.baseURL)) return null
 
   try {
     const client = makeClient(p)
@@ -170,7 +175,7 @@ async function callProvider(p, messages, maxTokens = 512) {
       },
       { signal: AbortSignal.timeout(p.timeout) }
     )
-    return res.choices[0]?.message?.content?.trim() || null
+    return (res.choices[0]?.message?.content ?? res.choices[0]?.message?.reasoning)?.trim() || null
   } catch (err) {
     if (err?.name === 'APIUserAbortError' || err?.name === 'TimeoutError') {
       console.warn(`[voice] ${p.name} timeout (${p.timeout}ms)`)
@@ -311,6 +316,17 @@ const FALLBACK_TOPICS = {
 }
 
 const VALID_CATEGORY_IDS = new Set(Object.keys(CATEGORIES))
+
+// ── Auth (optional) ───────────────────────────────────────────────────────────
+// Set VOICE_ADMIN_TOKEN in .env to require X-Voice-Token header on all write endpoints.
+// sendBeacon calls (beforeunload) pass it as ?token= query param instead.
+const ADMIN_TOKEN = process.env.VOICE_ADMIN_TOKEN || ''
+function requireAuth(req, res, next) {
+  if (!ADMIN_TOKEN) return next()
+  const token = req.headers['x-voice-token'] || req.query.token
+  if (token !== ADMIN_TOKEN) return res.status(401).json({ error: 'unauthorized' })
+  next()
+}
 
 // ── API: Get topic ───────────────────────────────────────────────────────────
 
@@ -489,7 +505,7 @@ function updateProfile(profile, analysis, category, userMsg, topic) {
   return profile
 }
 
-app.post('/api/analyze', analyzeLimit, async (req, res) => {
+app.post('/api/analyze', analyzeLimit, requireAuth, async (req, res) => {
   const { topic, response: userMsg, category, fast = false } = req.body
   if (!userMsg?.trim()) return res.status(400).json({ error: 'empty response' })
   if (typeof userMsg !== 'string' || userMsg.length > 1000)
@@ -543,13 +559,13 @@ app.get('/api/profile', (req, res) => {
 
 app.get('/api/history', (req, res) => {
   const all = readConvs().filter(c => !c.deleted)
-  const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 200), 500)
+  const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 200), 200)
   const category = req.query.category
   const filtered = category ? all.filter(c => c.category === category) : all
   res.json(filtered.slice(0, limit))
 })
 
-app.delete('/api/history/:id', (req, res) => {
+app.delete('/api/history/:id', requireAuth, (req, res) => {
   const { id } = req.params
   const all = readConvs()
   const idx = all.findIndex(c => c.id === id)
@@ -560,7 +576,7 @@ app.delete('/api/history/:id', (req, res) => {
   res.json({ ok: true })
 })
 
-app.post('/api/profile/rebuild', rebuildLimit, (req, res) => {
+app.post('/api/profile/rebuild', rebuildLimit, requireAuth, (req, res) => {
   const samples = readConvs().filter(s => !s.deleted && s.analysis)
   let profile = { totalSamples: 0, tone: {}, language: {}, patterns: {}, byCategory: {} }
   for (const s of samples) {
@@ -617,11 +633,13 @@ function buildWeaknessReport(profile) {
 // ── Template helpers ──────────────────────────────────────────────────────────
 
 const TMPL_FILE = path.join(DATA_DIR, 'templates.json')
+let _templatesCache = undefined  // undefined = not loaded, null = file does not exist
 
 // Normalize templates.json → always { generated, basedOnSamples, templates: { cat: [{ text, applied, appliedAt }] } }
 function readTemplates() {
+  if (_templatesCache !== undefined) return _templatesCache
   const raw = readJSON(TMPL_FILE, null)
-  if (!raw) return null
+  if (!raw) { _templatesCache = null; return null }
   const normalized = {}
   for (const [cat, items] of Object.entries(raw.templates || {})) {
     normalized[cat] = (items || []).map(item =>
@@ -630,10 +648,12 @@ function readTemplates() {
         : item
     )
   }
-  return { ...raw, templates: normalized }
+  _templatesCache = { ...raw, templates: normalized }
+  return _templatesCache
 }
 
 function saveTemplates(tmpl) {
+  _templatesCache = tmpl
   writeJSON(TMPL_FILE, tmpl)
 }
 
@@ -672,7 +692,7 @@ app.get('/api/templates', (req, res) => {
 
 // ── API: Apply a single template to ROS ──────────────────────────────────────
 
-app.post('/api/templates/apply', async (req, res) => {
+app.post('/api/templates/apply', requireAuth, async (req, res) => {
   const { category, text } = req.body
   if (!category || !text) return res.status(400).json({ error: 'category and text required' })
 
@@ -713,14 +733,20 @@ app.post('/api/templates/apply', async (req, res) => {
 
 // ── API: Generate Relationship OS templates ───────────────────────────────────
 
-app.post('/api/generate-templates', async (req, res) => {
+app.post('/api/generate-templates', requireAuth, async (req, res) => {
   const profile = readProfile()
   const cleanSamples = readConvs().filter(c => !c.deleted)
   if (cleanSamples.length < 5) {
     return res.status(400).json({ error: `需要至少 5 個樣本才能生成模板（目前：${cleanSamples.length}）` })
   }
 
-  const examples = cleanSamples.slice(0, 10).map(c => `[${c.category}] ${c.response}`).join('\n')
+  // Spread across categories — up to 2 examples each so all 8 categories are represented
+  const exByCategory = {}
+  for (const s of cleanSamples) {
+    if (!exByCategory[s.category]) exByCategory[s.category] = []
+    if (exByCategory[s.category].length < 2) exByCategory[s.category].push(s)
+  }
+  const examples = Object.values(exByCategory).flat().map(c => `[${c.category}] ${c.response}`).join('\n')
   const voiceDesc = buildVoiceDescription(profile)
 
   const templatePrompt = [
@@ -801,7 +827,7 @@ app.get('/api/session/memories', (req, res) => {
 
 // ── API: End session — generate qualitative memory ────────────────────────────
 
-app.post('/api/session/end', async (req, res) => {
+app.post('/api/session/end', requireAuth, async (req, res) => {
   const { messages = [], sessionSamples = 0 } = req.body
   if (!Array.isArray(messages) || messages.length > 200)
     return res.status(400).json({ error: 'invalid messages' })
@@ -996,7 +1022,7 @@ async function streamToClient(res, provider, chatMsgs, maxTokens) {
     })
     for await (const chunk of stream) {
       if (closed) break
-      const token = chunk.choices[0]?.delta?.content
+      const token = chunk.choices[0]?.delta?.content ?? chunk.choices[0]?.delta?.reasoning
       if (token) write({ token })
     }
   } catch (err) {
@@ -1021,7 +1047,7 @@ function pickFastProvider() {
 
 async function callProviderFallback(messages, maxTokens) {
   const candidates = PROVIDERS
-    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama' && p.name !== 'Groq-Qwen3')
+    .filter(p => !isCooling(p.name) && p.key && p.name !== 'Ollama')
     .sort((a, b) => a.timeout - b.timeout)
   for (const p of candidates) {
     const result = await callProvider(p, messages, maxTokens)
@@ -1030,7 +1056,7 @@ async function callProviderFallback(messages, maxTokens) {
   return null
 }
 
-app.post('/api/assistant/chat/stream', streamLimit, async (req, res) => {
+app.post('/api/assistant/chat/stream', streamLimit, requireAuth, async (req, res) => {
   const { messages = [], userMessage, interviewMode = false, interviewCategory = 'greeting', isStart = false } = req.body
   if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
 
@@ -1099,7 +1125,7 @@ function styleScenarioSeed() {
   return STYLE_SCENARIO_SEEDS[Math.floor(Math.random() * STYLE_SCENARIO_SEEDS.length)]
 }
 
-app.post('/api/style/chat/stream', streamLimit, async (req, res) => {
+app.post('/api/style/chat/stream', streamLimit, requireAuth, async (req, res) => {
   const { messages = [], userMessage, styleId, isStart = false } = req.body
   if (!isStart && !userMessage?.trim()) return res.status(400).json({ error: 'empty message' })
 

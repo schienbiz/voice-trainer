@@ -2,6 +2,12 @@ import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 
 const API = '/api'
 
+// ── Auth helpers ─────────────────────────────────────────────────────────────
+// Set VOICE_ADMIN_TOKEN on server; client stores it once in localStorage.
+// sendBeacon (beforeunload) passes token as ?token= since it can't set headers.
+const getToken = () => localStorage.getItem('voiceToken') || ''
+const getAuthHeaders = () => { const t = getToken(); return t ? { 'X-Voice-Token': t } : {} }
+
 const CATEGORIES = [
   { id: 'greeting',    label: '打招呼',   emoji: '👋' },
   { id: 'celebration', label: '慶祝讚美', emoji: '🎉' },
@@ -50,14 +56,15 @@ function chip(text, count) {
   )
 }
 
-async function streamSSE(url, body, onToken, onDone, onError, signal) {
+async function streamSSE(url, body, onToken, onDone, onError, signal, extraHeaders = {}) {
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...extraHeaders },
       body: JSON.stringify(body),
       signal,
     })
+    if (res.status === 401) { onError?.('unauthorized'); return }
     if (!res.ok) {
       const data = await res.json().catch(() => ({}))
       onError?.(data.error || `HTTP ${res.status}`)
@@ -139,6 +146,8 @@ export default function App() {
   const [memories, setMemories] = useState([])
   const [historyFilter, setHistoryFilter] = useState('all')
   const [rebuilding, setRebuilding] = useState(false)
+  const [authError, setAuthError] = useState(false)
+  const [authTokenInput, setAuthTokenInput] = useState('')
 
   // Auto-mic (hands-free mode)
   const [autoMicEnabled, setAutoMicEnabled] = useState(false)
@@ -180,6 +189,12 @@ export default function App() {
   useEffect(() => {
     styleChatEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [styleChatHistory])
+
+  // 401 handler — show token overlay so user can re-authenticate
+  const handleAuthFail = useCallback((errMsgOrStatus) => {
+    if (errMsgOrStatus === 'unauthorized' || errMsgOrStatus === 401) { setAuthError(true); return true }
+    return false
+  }, [])
 
   const prevTabRef = useRef('train')
 
@@ -250,9 +265,29 @@ export default function App() {
     return () => clearInterval(interval)
   }, [fetchProviders])
 
+  // Save session memory when user closes the browser tab directly (beforeunload)
+  // Uses sendBeacon so the request fires even after page teardown.
+  // Token passed as ?token= query param because sendBeacon cannot set custom headers.
+  useEffect(() => {
+    const onUnload = () => {
+      const userMsgs = chatHistory.filter(m => m.role === 'user' && m.content?.trim())
+      if (userMsgs.length < 2) return
+      const payload = JSON.stringify({
+        messages: chatHistory.map(({ role, content }) => ({ role, content: content || '' })),
+        sessionSamples,
+      })
+      const t = getToken()
+      const endpoint = t ? `${API}/session/end?token=${encodeURIComponent(t)}` : `${API}/session/end`
+      navigator.sendBeacon?.(endpoint, new Blob([payload], { type: 'application/json' }))
+    }
+    window.addEventListener('beforeunload', onUnload)
+    return () => window.removeEventListener('beforeunload', onUnload)
+  }, [chatHistory, sessionSamples])
+
   const deleteHistorySample = useCallback(async (id) => {
     if (!confirm('刪除這個樣本？（不可復原）')) return
-    await fetch(`${API}/history/${id}`, { method: 'DELETE' })
+    const dr = await fetch(`${API}/history/${id}`, { method: 'DELETE', headers: getAuthHeaders() })
+    if (handleAuthFail(dr.status)) return
     setHistory(h => h.filter(x => x.id !== id))
     showFeedback('已刪除。建議在風格報告頁點「重建風格報告」更新統計。')
   }, [])
@@ -260,7 +295,8 @@ export default function App() {
   const rebuildProfile = useCallback(async () => {
     setRebuilding(true)
     try {
-      const r = await fetch(`${API}/profile/rebuild`, { method: 'POST' })
+      const r = await fetch(`${API}/profile/rebuild`, { method: 'POST', headers: getAuthHeaders() })
+      if (handleAuthFail(r.status)) return
       if (r.ok) {
         await fetchProfile()
         showFeedback('風格報告已從現有樣本重建 ✅')
@@ -296,9 +332,10 @@ export default function App() {
     try {
       const r = await fetch(`${API}/analyze`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({ topic: topic.topic, response, category }),
       })
+      if (handleAuthFail(r.status)) return
       const data = await r.json()
       if (r.ok) {
         setLastAnalysis(data.analysis)
@@ -310,13 +347,13 @@ export default function App() {
         const savedResponse = response
         fetch(`${API}/coach`, {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
           body: JSON.stringify({ analysis: data.analysis, userMsg: savedResponse }),
         }).then(r => r.json()).then(d => {
           if (d.tip) { setCoachTip(d.tip); speak(d.tip) }
         }).catch(() => {})
 
-        setTimeout(() => loadTopic(category), 1500)
+        loadTopic(category)
       } else {
         showFeedback({ type: 'error', msg: `❌ ${data.error}` })
       }
@@ -329,7 +366,8 @@ export default function App() {
     setLoading(l => ({ ...l, export: true }))
     setFeedback(null)
     try {
-      const r = await fetch(`${API}/generate-templates`, { method: 'POST' })
+      const r = await fetch(`${API}/generate-templates`, { method: 'POST', headers: getAuthHeaders() })
+      if (handleAuthFail(r.status)) return
       const data = await r.json()
       if (r.ok) {
         setTemplates({ templates: data.templates, basedOnSamples: data.basedOnSamples, generated: new Date().toISOString() })
@@ -350,9 +388,10 @@ export default function App() {
     try {
       const r = await fetch(`${API}/templates/apply`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
         body: JSON.stringify({ category, text }),
       })
+      if (handleAuthFail(r.status)) return
       const data = await r.json()
       if (r.ok && data.ok) {
         setTemplates(prev => ({
@@ -489,17 +528,19 @@ export default function App() {
             setTimeout(() => toggleAssistantVoiceRef.current?.(), 350)
         })
       },
-      () => {
+      (err) => {
+        if (handleAuthFail(err)) return
         setChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: '⚠️ 連線失敗，請重試', streaming: false } : m))
         setLoading(l => ({ ...l, assistant: false }))
       },
       ctrl.signal,
+      getAuthHeaders(),
     )
 
     // Parallel fast analyze (fire-and-forget)
     fetch(`${API}/analyze`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({ topic: lastAIQuestion, response: msg, category: catForMsg.id, fast: true }),
     }).then(r => r.json()).then(data => {
       if (data.profile) { setProfile(data.profile); fetchHistory() }
@@ -515,7 +556,7 @@ export default function App() {
     const messages = history.map(({ role, content }) => ({ role, content: content || '' }))
     fetch(`${API}/session/end`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...getAuthHeaders() },
       body: JSON.stringify({ messages, sessionSamples: samplesCount }),
     }).then(r => r.json()).then(data => {
       if (data.memory) setMemories(prev => [...prev, data.memory].slice(-20))
@@ -552,11 +593,13 @@ export default function App() {
             setTimeout(() => toggleAssistantVoiceRef.current?.(), 350)
         })
       },
-      () => {
+      (err) => {
+        if (handleAuthFail(err)) return
         setChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'start' }])
         setLoading(l => ({ ...l, assistant: false }))
       },
       ctrl.signal,
+      getAuthHeaders(),
     )
   }
 
@@ -584,11 +627,13 @@ export default function App() {
             setTimeout(() => toggleStyleVoiceRef.current?.(), 350)
         })
       },
-      () => {
+      (err) => {
+        if (handleAuthFail(err)) return
         setStyleChatHistory([{ role: 'assistant', content: '⚠️ 無法連線，請重新整理', id: 'style-start-err' }])
         setStyleLoading(false)
       },
       ctrl.signal,
+      getAuthHeaders(),
     )
   }
 
@@ -625,11 +670,13 @@ export default function App() {
             setTimeout(() => toggleStyleVoiceRef.current?.(), 350)
         })
       },
-      () => {
+      (err) => {
+        if (handleAuthFail(err)) return
         setStyleChatHistory(h => h.map(m => m.id === streamId ? { ...m, content: '⚠️ 連線失敗，請重試', streaming: false } : m))
         setStyleLoading(false)
       },
       styleCtrl.signal,
+      getAuthHeaders(),
     )
   }
 
@@ -734,6 +781,42 @@ export default function App() {
   // ── Render ───────────────────────────────────────────────────────────────────
   return (
     <div style={s.page}>
+      {/* Auth overlay — shown when server returns 401 (VOICE_ADMIN_TOKEN is set) */}
+      {authError && (
+        <div style={{ position: 'fixed', inset: 0, background: '#000000cc', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div style={{ background: '#13131a', border: '1px solid #6c63ff55', borderRadius: 16, padding: 32, width: 320 }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 6 }}>🔐 需要驗證</div>
+            <div style={{ fontSize: 12, color: '#555', marginBottom: 20 }}>在 .env 設定 VOICE_ADMIN_TOKEN 後需要此 token</div>
+            <input
+              type="password"
+              value={authTokenInput}
+              onChange={e => setAuthTokenInput(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter' && authTokenInput.trim()) {
+                  localStorage.setItem('voiceToken', authTokenInput.trim())
+                  setAuthError(false)
+                  setAuthTokenInput('')
+                }
+              }}
+              style={{ width: '100%', background: '#0d0d15', border: '1px solid #2a2a3a', borderRadius: 8, color: '#e8e8f0', padding: '10px 14px', fontSize: 14, outline: 'none', boxSizing: 'border-box', marginBottom: 12 }}
+              placeholder="輸入 token…"
+              autoFocus
+            />
+            <button
+              onClick={() => {
+                if (authTokenInput.trim()) {
+                  localStorage.setItem('voiceToken', authTokenInput.trim())
+                  setAuthError(false)
+                  setAuthTokenInput('')
+                }
+              }}
+              style={{ width: '100%', padding: 10, borderRadius: 8, border: 'none', background: '#6c63ff', color: '#fff', fontWeight: 600, cursor: 'pointer', fontSize: 14 }}
+            >
+              確認，重新連線
+            </button>
+          </div>
+        </div>
+      )}
       {/* Header */}
       <div style={s.header}>
         <span style={s.title}>🎙 Voice Trainer — 個人對話風格學習</span>
