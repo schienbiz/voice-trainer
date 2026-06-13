@@ -331,6 +331,7 @@ function requireAuth(req, res, next) {
 // ── API: Get topic ───────────────────────────────────────────────────────────
 
 const app = express()
+app.set('trust proxy', 1)  // Render sits behind a proxy; needed for accurate per-IP rate limiting
 app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }))
 app.use(express.json({ limit: '64kb' }))
 
@@ -510,6 +511,8 @@ app.post('/api/analyze', analyzeLimit, requireAuth, async (req, res) => {
   if (!userMsg?.trim()) return res.status(400).json({ error: 'empty response' })
   if (typeof userMsg !== 'string' || userMsg.length > 1000)
     return res.status(400).json({ error: 'response too long (max 1000 chars)' })
+  if (topic && (typeof topic !== 'string' || topic.length > 500))
+    return res.status(400).json({ error: 'topic too long (max 500 chars)' })
   if (category && !VALID_CATEGORY_IDS.has(category))
     return res.status(400).json({ error: 'invalid category' })
 
@@ -589,7 +592,7 @@ app.post('/api/profile/rebuild', rebuildLimit, requireAuth, (req, res) => {
   res.json({ ok: true, totalSamples: profile.totalSamples })
 })
 
-app.get('/api/export', (req, res) => {
+app.get('/api/export', requireAuth, (req, res) => {
   const samples = readConvs().filter(s => !s.deleted)
   const profile = readProfile()
   const payload = { exportedAt: new Date().toISOString(), totalSamples: samples.length, profile, samples }
@@ -821,7 +824,7 @@ app.get('/api/providers', (req, res) => {
 
 // ── API: Get session memories ─────────────────────────────────────────────────
 
-app.get('/api/session/memories', (req, res) => {
+app.get('/api/session/memories', requireAuth, (req, res) => {
   res.json(readMemories())
 })
 
@@ -1158,7 +1161,7 @@ app.post('/api/style/chat/stream', streamLimit, requireAuth, async (req, res) =>
 
 // ── API: Coach tip ─────────────────────────────────────────────────────────────
 
-app.post('/api/coach', coachLimit, async (req, res) => {
+app.post('/api/coach', coachLimit, requireAuth, async (req, res) => {
   const { analysis, userMsg } = req.body
   if (!analysis) return res.status(400).json({ error: 'no analysis' })
 

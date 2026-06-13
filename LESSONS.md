@@ -5,7 +5,7 @@
 
 ---
 
-## ✅ 已套用的修正（9 項）
+## ✅ 已套用的修正（15 項）
 
 ### 1. Cerebras 120B `content=null` bug（streaming + 非 streaming）
 **問題：** Cerebras gpt-oss-120b 在 max_tokens < 400 時回傳 `content: null`，token 放在 `reasoning` 欄位。
@@ -122,6 +122,76 @@ window.addEventListener('beforeunload', onUnload)
 
 ---
 
+### 10. `trust proxy` 讓 Render 上的 rate limiting 正確計算 per-IP
+**問題：** Express 預設信任 `req.ip` 為直連 IP。Render 在 load balancer 後面，所有請求的 `req.ip` 都是 Render proxy 的 IP，所以 rate limit 計算是全站共用而非 per-user。
+```js
+app.set('trust proxy', 1)  // 加在 app = express() 之後
+```
+**教訓：** 部署在 Render/Heroku/Fly 等有 proxy 的平台，rate limiter 一定要設 `trust proxy`，否則看的是同一個 IP，全站用戶共用同一個 quota。
+
+---
+
+### 11. `/api/export`、`/api/session/memories`、`/api/coach` 缺少 auth
+**問題：** 這三個端點沒有 `requireAuth`：
+- `/api/export` GET：任何人可下載所有樣本和 profile
+- `/api/session/memories` GET：session 觀察記錄裸露
+- `/api/coach` POST：消耗 API key 但無保護
+```js
+// 加 requireAuth 即可
+app.get('/api/export', requireAuth, ...)
+app.get('/api/session/memories', requireAuth, ...)
+app.post('/api/coach', coachLimit, requireAuth, ...)
+```
+**教訓：** 加新端點時，建立 checklist：「這個端點讀私人資料或消耗 API key？→ 加 `requireAuth`」。GET 端點容易被忽略，因為直覺上「讀取是安全的」。
+
+---
+
+### 12. 讀端點加 auth 後前端 fetch 要同步更新 headers
+**問題：** 加 `requireAuth` 到 `GET /api/session/memories` 後，前端 `fetchMemories()` 沒送 auth headers，立刻 401。
+```js
+// 舊
+const r = await fetch(`${API}/session/memories`)
+// 新
+const r = await fetch(`${API}/session/memories`, { headers: getAuthHeaders() })
+```
+**教訓：** Server 加 auth 和 Frontend 更新 headers 要配對進行，否則自己的 app 馬上壞掉。用 grep 找所有對該端點的 fetch，全部更新。
+
+---
+
+### 13. Export `<a href>` 無法帶 custom header，改用 `?token=` query param
+**問題：** `<a href="/api/export" download>` 是瀏覽器原生 navigation，無法注入 `X-Voice-Token` header。加了 `requireAuth` 後就 401。
+```jsx
+// 舊
+<a href={`${API}/export`} download>
+// 新
+<a href={`${API}/export${getToken() ? '?token=' + encodeURIComponent(getToken()) : ''}`} download>
+```
+**教訓：** 凡是 `<a href>` 或 `window.location` 等非 fetch 觸發的 HTTP 請求，都不能帶 custom header，token 要走 query param。`requireAuth` 已支援 `req.query.token`，前後端一致。
+
+---
+
+### 14. Auth 成功後要重新 fetch 資料
+**問題：** 使用者輸入 token 後關掉 auth overlay，但畫面資料是 401 時殘留的舊狀態（空的或截斷的）。
+```js
+// 關閉 overlay 時
+localStorage.setItem('voiceToken', token)
+setAuthError(false)
+fetchProfile(); fetchHistory(); fetchTemplates(); fetchMemories()
+```
+**教訓：** Auth overlay 確認後立即 re-fetch 全部資料，不要讓使用者看到空畫面、手動 refresh。
+
+---
+
+### 15. `/api/analyze` 缺少 topic 長度驗證
+**問題：** `userMsg` 有 1000 字限制，但 `topic` 沒有任何限制，理論上可傳入數 MB 的 topic 進 prompt。
+```js
+if (topic && (typeof topic !== 'string' || topic.length > 500))
+  return res.status(400).json({ error: 'topic too long (max 500 chars)' })
+```
+**教訓：** 每個進入 AI prompt 的欄位都要設上限，否則攻擊者可以塞巨大字串讓 token 爆表或超時。
+
+---
+
 ## ❌ 排除的修正（5 項，附理由）
 
 ### X1. 風格練習 Tab 無 Session Memory
@@ -189,3 +259,8 @@ useEffect(() => { ... }, [chatHistory, sessionSamples])  // OK
 | **AI fallback 策略** | reasoning model + effort=none ≈ 一般 model，不需要從 fallback 池子排除。排除要有明確理由 |
 | **參數上限一致性** | API 的 limit/max 參數上限要和實際儲存/查詢上限一致，避免 caller 誤判 |
 | **probe 快取** | 任何外部服務的可用性探測都要加快取 TTL，避免在 hot path 反覆做 |
+| **Render trust proxy** | Render/Heroku/Fly 等 proxy 平台部署必須設 `app.set('trust proxy', 1)`，否則 rate limiter 看到的是 proxy IP |
+| **GET 端點 auth 盲點** | GET 端點直覺上「只是讀取」，但若有私人資料或消耗資源，一樣要加 `requireAuth` |
+| **`<a href>` 無法帶 header** | 瀏覽器原生 navigation（`<a>`、`window.location`）不支援 custom header；auth token 改走 query param |
+| **Auth 後重 fetch** | 登入後立即 re-fetch 全部資料，避免使用者看到 401 時殘留的空白 UI |
+| **Prompt 輸入欄位驗證** | 每個進入 AI prompt 的 req.body 欄位都要設長度上限，防止 token 爆表攻擊 |

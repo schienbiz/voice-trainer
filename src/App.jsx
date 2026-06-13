@@ -247,7 +247,7 @@ export default function App() {
   }, [])
 
   const fetchMemories = useCallback(async () => {
-    const r = await fetch(`${API}/session/memories`)
+    const r = await fetch(`${API}/session/memories`, { headers: getAuthHeaders() })
     if (r.ok) setMemories(await r.json())
   }, [])
 
@@ -796,6 +796,7 @@ export default function App() {
                   localStorage.setItem('voiceToken', authTokenInput.trim())
                   setAuthError(false)
                   setAuthTokenInput('')
+                  fetchProfile(); fetchHistory(); fetchTemplates(); fetchMemories()
                 }
               }}
               style={{ width: '100%', background: '#0d0d15', border: '1px solid #2a2a3a', borderRadius: 8, color: '#e8e8f0', padding: '10px 14px', fontSize: 14, outline: 'none', boxSizing: 'border-box', marginBottom: 12 }}
@@ -808,6 +809,7 @@ export default function App() {
                   localStorage.setItem('voiceToken', authTokenInput.trim())
                   setAuthError(false)
                   setAuthTokenInput('')
+                  fetchProfile(); fetchHistory(); fetchTemplates(); fetchMemories()
                 }
               }}
               style={{ width: '100%', padding: 10, borderRadius: 8, border: 'none', background: '#6c63ff', color: '#fff', fontWeight: 600, cursor: 'pointer', fontSize: 14 }}
@@ -1488,7 +1490,7 @@ export default function App() {
                     }}>{label}</button>
                   ))}
                 </div>
-                <a href={`${API}/export`} download style={{ ...s.btn('secondary'), fontSize: 11, padding: '5px 12px', textDecoration: 'none' }}>
+                <a href={`${API}/export${getToken() ? '?token=' + encodeURIComponent(getToken()) : ''}`} download style={{ ...s.btn('secondary'), fontSize: 11, padding: '5px 12px', textDecoration: 'none' }}>
                   ⬇ 匯出
                 </a>
               </div>
