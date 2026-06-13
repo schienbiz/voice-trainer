@@ -36,9 +36,7 @@ const db = process.env.VOICE_DATABASE_URL
 
 async function dbRun(sql, params = []) {
   if (!db) return null
-  const client = await db.connect()
-  try { return await client.query(sql, params) }
-  finally { client.release() }
+  return db.query(sql, params)
 }
 
 async function syncProfileToNeon(profile) {
@@ -160,28 +158,29 @@ async function callProvider(p, messages, maxTokens = 512) {
     }
   }
 
-  let done = false
   try {
     const client = makeClient(p)
-    return await Promise.race([
-      (async () => {
-        const res = await client.chat.completions.create({
-          model: p.model,
-          messages,
-          max_tokens: maxTokens,
-          temperature: 0.3,
-          ...(p.extraParams || {}),
-        })
-        done = true
-        return res.choices[0]?.message?.content?.trim() || null
-      })(),
-      new Promise(resolve => setTimeout(() => { if (!done) console.warn(`[voice] ${p.name} timeout`); resolve(null) }, p.timeout)),
-    ])
+    const res = await client.chat.completions.create(
+      {
+        model: p.model,
+        messages,
+        max_tokens: maxTokens,
+        temperature: 0.3,
+        ...(p.extraParams || {}),
+      },
+      { signal: AbortSignal.timeout(p.timeout) }
+    )
+    return res.choices[0]?.message?.content?.trim() || null
   } catch (err) {
-    done = true
-    if (err?.status === 402 || err?.message?.includes('402')) setCooldown(p.name, '402')
-    else if (err?.status === 429 || err?.message?.includes('429')) setCooldown(p.name, '429')
-    console.warn(`[voice] ${p.name} failed: ${err.message?.slice(0, 60)}`)
+    if (err?.name === 'APIUserAbortError' || err?.name === 'TimeoutError') {
+      console.warn(`[voice] ${p.name} timeout (${p.timeout}ms)`)
+    } else if (err?.status === 402 || err?.message?.includes('402')) {
+      setCooldown(p.name, '402')
+    } else if (err?.status === 429 || err?.message?.includes('429')) {
+      setCooldown(p.name, '429')
+    } else {
+      console.warn(`[voice] ${p.name} failed: ${err.message?.slice(0, 60)}`)
+    }
     return null
   }
 }
@@ -216,6 +215,17 @@ function readTopicsUsed() {
 function writeTopicsUsed(data) {
   _topicsUsedCache = data
   writeJSON(TOPICS_USED_FILE, data)
+}
+
+// In-memory cache for conversations.json — avoids repeated disk reads on analyze/history/export
+let _convsCache = null
+function readConvs() {
+  if (!_convsCache) _convsCache = readJSON(CONV_FILE, [])
+  return _convsCache
+}
+function writeConvs(data) {
+  _convsCache = data
+  writeJSON(CONV_FILE, data)
 }
 
 // ── Topic definitions ─────────────────────────────────────────────────────────
@@ -504,10 +514,10 @@ app.post('/api/analyze', analyzeLimit, async (req, res) => {
 
   // Log conversation
   const sample = { id: Date.now().toString(), category, topic, response: userMsg, analysis: merged, at: new Date().toISOString() }
-  const convs = readJSON(CONV_FILE, [])
+  const convs = readConvs()
   convs.unshift(sample)
   if (convs.length > 200) convs.splice(200)
-  writeJSON(CONV_FILE, convs)
+  writeConvs(convs)
 
   // Sync to Neon (fire-and-forget)
   syncProfileToNeon(updated).catch(() => {})
@@ -527,7 +537,7 @@ app.get('/api/profile', (req, res) => {
 // ── API: History ──────────────────────────────────────────────────────────────
 
 app.get('/api/history', (req, res) => {
-  const all = readJSON(CONV_FILE, []).filter(c => !c.deleted)
+  const all = readConvs().filter(c => !c.deleted)
   const limit = Math.min(Math.max(1, parseInt(req.query.limit) || 200), 500)
   const category = req.query.category
   const filtered = category ? all.filter(c => c.category === category) : all
@@ -536,17 +546,17 @@ app.get('/api/history', (req, res) => {
 
 app.delete('/api/history/:id', (req, res) => {
   const { id } = req.params
-  const all = readJSON(CONV_FILE, [])
+  const all = readConvs()
   const idx = all.findIndex(c => c.id === id)
   if (idx === -1) return res.status(404).json({ error: 'not found' })
   all[idx].deleted = true
-  writeJSON(CONV_FILE, all)
+  writeConvs(all)
   console.log(`[voice] deleted sample ${id}`)
   res.json({ ok: true })
 })
 
 app.post('/api/profile/rebuild', rebuildLimit, (req, res) => {
-  const samples = readJSON(CONV_FILE, []).filter(s => !s.deleted && s.analysis)
+  const samples = readConvs().filter(s => !s.deleted && s.analysis)
   let profile = { totalSamples: 0, tone: {}, language: {}, patterns: {}, byCategory: {} }
   for (const s of samples) {
     const analysis = { ...s.analysis, styleNotes: s.analysis.styleNote ? [s.analysis.styleNote] : (s.analysis.styleNotes || []) }
@@ -559,7 +569,7 @@ app.post('/api/profile/rebuild', rebuildLimit, (req, res) => {
 })
 
 app.get('/api/export', (req, res) => {
-  const samples = readJSON(CONV_FILE, []).filter(s => !s.deleted)
+  const samples = readConvs().filter(s => !s.deleted)
   const profile = readProfile()
   const payload = { exportedAt: new Date().toISOString(), totalSamples: samples.length, profile, samples }
   res.setHeader('Content-Disposition', `attachment; filename="voice-trainer-export-${new Date().toISOString().split('T')[0]}.json"`)
@@ -700,7 +710,7 @@ app.post('/api/templates/apply', async (req, res) => {
 
 app.post('/api/generate-templates', async (req, res) => {
   const profile = readProfile()
-  const cleanSamples = readJSON(CONV_FILE, []).filter(c => !c.deleted)
+  const cleanSamples = readConvs().filter(c => !c.deleted)
   if (cleanSamples.length < 5) {
     return res.status(400).json({ error: `需要至少 5 個樣本才能生成模板（目前：${cleanSamples.length}）` })
   }
@@ -1138,7 +1148,7 @@ async function initNeon() {
     console.log('[db] schema ready')
 
     const { rows: [{ n: dbCount }] } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
-    const localSamples = readJSON(CONV_FILE, [])
+    const localSamples = readConvs()
     const localProfile = readProfile()
 
     if (dbCount === 0 && localSamples.length > 0) {
@@ -1160,7 +1170,7 @@ async function initNeon() {
         response: r.response, analysis: r.analysis,
         at: r.created_at instanceof Date ? r.created_at.toISOString() : r.created_at,
       }))
-      writeJSON(CONV_FILE, restored)
+      writeConvs(restored)
       if (profileRows.length > 0) writeProfile(profileRows[0].data)
       console.log(`[db] restored ${restored.length} samples from DB to local JSON`)
     } else {

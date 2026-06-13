@@ -245,6 +245,11 @@ export default function App() {
     loadTopic('greeting')
   }, [])
 
+  useEffect(() => {
+    const interval = setInterval(fetchProviders, 60_000)
+    return () => clearInterval(interval)
+  }, [fetchProviders])
+
   const deleteHistorySample = useCallback(async (id) => {
     if (!confirm('刪除這個樣本？（不可復原）')) return
     await fetch(`${API}/history/${id}`, { method: 'DELETE' })
