@@ -161,6 +161,22 @@ window.addEventListener('beforeunload', onUnload)
 
 ---
 
+---
+
+### X6（後記）. `useEffect` dep array 引用 `useMemo` 導致 TDZ crash（部署後發現）
+**為何排除 → 改為緊急修正：** 修正 #7（beforeunload sendBeacon）加入後，`useEffect(..., [chatHistory, sessionSamples])` 的 dep array 在 function body 執行到這行時就立刻被求值，但 `sessionSamples = useMemo(...)` 宣告在 450 行後面。`const` 的 TDZ 導致生產環境出現 `ReferenceError: Cannot access 'Jn' before initialization`，整個 React app 無法 render（白屏）。
+```js
+// ❌ 錯誤：useEffect 在 line 271，sessionSamples 在 line 725
+useEffect(() => { ... }, [chatHistory, sessionSamples])  // dep array 立刻求值！
+
+// ✅ 修正：把 useEffect 移到 sessionSamples 宣告之後
+const sessionSamples = useMemo(...)
+useEffect(() => { ... }, [chatHistory, sessionSamples])  // OK
+```
+**教訓：** React dep array 不是 closure，它是立刻求值的陣列字面值。在 React component function body 裡，`const` 變數在宣告前都在 TDZ。把 `useEffect` 的 dep 包含到比 `useEffect` 本身晚宣告的變數，Vite 打包不會報錯，但瀏覽器 runtime 直接爆炸。rule: **所有 dep array 的變數必須在 `useEffect` 呼叫之前宣告。**
+
+---
+
 ## 通用教訓總結
 
 | 模式 | 教訓 |
@@ -169,6 +185,7 @@ window.addEventListener('beforeunload', onUnload)
 | **In-memory cache** | 每加一個新 data store 就要問：「我有沒有給它快取？快取失效時機是否正確？」|
 | **個人工具部署** | 即使是個人工具，部署到公開 URL 就要加 token auth。opt-in（未設定就開放）的設計兼顧開發便利 |
 | **beforeunload** | `fetch` 在 beforeunload 中不可靠；必須用 `sendBeacon`。sendBeacon 不支援自訂 header，token 改走 query param |
+| **useEffect dep TDZ** | dep array 是立刻求值的，不是 closure。dep 中的所有變數必須在 `useEffect` 呼叫前已宣告，Vite 不會在 build 時報錯但 runtime 會 crash |
 | **AI fallback 策略** | reasoning model + effort=none ≈ 一般 model，不需要從 fallback 池子排除。排除要有明確理由 |
 | **參數上限一致性** | API 的 limit/max 參數上限要和實際儲存/查詢上限一致，避免 caller 誤判 |
 | **probe 快取** | 任何外部服務的可用性探測都要加快取 TTL，避免在 hot path 反覆做 |
