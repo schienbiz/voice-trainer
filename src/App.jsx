@@ -265,25 +265,6 @@ export default function App() {
     return () => clearInterval(interval)
   }, [fetchProviders])
 
-  // Save session memory when user closes the browser tab directly (beforeunload)
-  // Uses sendBeacon so the request fires even after page teardown.
-  // Token passed as ?token= query param because sendBeacon cannot set custom headers.
-  useEffect(() => {
-    const onUnload = () => {
-      const userMsgs = chatHistory.filter(m => m.role === 'user' && m.content?.trim())
-      if (userMsgs.length < 2) return
-      const payload = JSON.stringify({
-        messages: chatHistory.map(({ role, content }) => ({ role, content: content || '' })),
-        sessionSamples,
-      })
-      const t = getToken()
-      const endpoint = t ? `${API}/session/end?token=${encodeURIComponent(t)}` : `${API}/session/end`
-      navigator.sendBeacon?.(endpoint, new Blob([payload], { type: 'application/json' }))
-    }
-    window.addEventListener('beforeunload', onUnload)
-    return () => window.removeEventListener('beforeunload', onUnload)
-  }, [chatHistory, sessionSamples])
-
   const deleteHistorySample = useCallback(async (id) => {
     if (!confirm('刪除這個樣本？（不可復原）')) return
     const dr = await fetch(`${API}/history/${id}`, { method: 'DELETE', headers: getAuthHeaders() })
@@ -731,6 +712,25 @@ export default function App() {
     const c = (profile?.byCategory?.[cat.id]?.samples  || 0) + (sessionCatCounts[cat.id]  || 0)
     return c < b ? cat : best
   }), [profile, sessionCatCounts])
+
+  // Save session memory when user closes the browser tab directly (beforeunload).
+  // Must be placed AFTER sessionSamples (useMemo) to avoid TDZ in dep array.
+  // sendBeacon fires even after page teardown; token goes in ?token= (no custom headers).
+  useEffect(() => {
+    const onUnload = () => {
+      const userMsgs = chatHistory.filter(m => m.role === 'user' && m.content?.trim())
+      if (userMsgs.length < 2) return
+      const payload = JSON.stringify({
+        messages: chatHistory.map(({ role, content }) => ({ role, content: content || '' })),
+        sessionSamples,
+      })
+      const t = getToken()
+      const endpoint = t ? `${API}/session/end?token=${encodeURIComponent(t)}` : `${API}/session/end`
+      navigator.sendBeacon?.(endpoint, new Blob([payload], { type: 'application/json' }))
+    }
+    window.addEventListener('beforeunload', onUnload)
+    return () => window.removeEventListener('beforeunload', onUnload)
+  }, [chatHistory, sessionSamples])
 
   // Keep refs current (all mutated each render so closures never go stale)
   sendAssistantRef.current = sendToAssistant
