@@ -39,7 +39,7 @@ async function dbRun(sql, params = []) {
   return db.query(sql, params)
 }
 
-async function syncProfileToNeon(profile) {
+async function syncProfileToDB(profile) {
   if (!db) return
   try {
     await dbRun(
@@ -50,7 +50,7 @@ async function syncProfileToNeon(profile) {
   } catch (e) { console.error('[db] profile sync error:', e.message) }
 }
 
-async function saveSampleToNeon(sample) {
+async function saveSampleToDB(sample) {
   if (!db) return
   try {
     await dbRun(
@@ -62,7 +62,7 @@ async function saveSampleToNeon(sample) {
   } catch (e) { console.error('[db] sample sync error:', e.message) }
 }
 
-async function syncMemoriesToNeon(memories) {
+async function syncMemoriesToDB(memories) {
   if (!db) return
   try {
     await dbRun(
@@ -543,9 +543,9 @@ app.post('/api/analyze', analyzeLimit, requireAuth, async (req, res) => {
   if (convs.length > 200) convs.splice(200)
   writeConvs(convs)
 
-  // Sync to Neon (fire-and-forget)
-  syncProfileToNeon(updated).catch(() => {})
-  saveSampleToNeon(sample).catch(() => {})
+  // Sync to DB (fire-and-forget)
+  syncProfileToDB(updated).catch(() => {})
+  saveSampleToDB(sample).catch(() => {})
 
   console.log(`[voice] analyzed sample #${updated.totalSamples} — ${merged.modelCount} models, category: ${category}`)
 
@@ -587,7 +587,7 @@ app.post('/api/profile/rebuild', rebuildLimit, requireAuth, (req, res) => {
     profile = updateProfile(profile, analysis, s.category, s.response, s.topic)
   }
   writeProfile(profile)
-  syncProfileToNeon(profile).catch(() => {})
+  syncProfileToDB(profile).catch(() => {})
   console.log(`[voice] profile rebuilt from ${profile.totalSamples} samples`)
   res.json({ ok: true, totalSamples: profile.totalSamples })
 })
@@ -614,7 +614,7 @@ function readMemories() {
 function writeMemories(memories) {
   _memoriesCache = memories
   writeJSON(MEMORIES_FILE, memories)
-  syncMemoriesToNeon(memories).catch(() => {})
+  syncMemoriesToDB(memories).catch(() => {})
 }
 
 function buildWeaknessReport(profile) {
@@ -1194,7 +1194,7 @@ if (process.env.NODE_ENV === 'production') {
 }
 
 // ── DB: init schema + bidirectional sync with local JSON ─────────────────────
-async function initNeon() {
+async function initDB() {
   if (!db) { console.log('[db] no VOICE_DATABASE_URL — skipping'); return }
   try {
     await dbRun(`
@@ -1226,8 +1226,8 @@ async function initNeon() {
 
     if (dbCount === 0 && localSamples.length > 0) {
       // Local has data, DB is empty → upload to DB
-      if (localProfile.totalSamples) await syncProfileToNeon(localProfile)
-      for (const s of localSamples) await saveSampleToNeon(s)
+      if (localProfile.totalSamples) await syncProfileToDB(localProfile)
+      for (const s of localSamples) await saveSampleToDB(s)
       console.log(`[db] uploaded ${localSamples.length} samples to DB`)
     } else if (dbCount > 0 && localSamples.length === 0) {
       // DB has data, local is empty (e.g. Render ephemeral FS) → restore from DB
@@ -1259,7 +1259,7 @@ async function initNeon() {
       _memoriesCache = restored
       console.log(`[db] restored ${restored.length} session memories from DB`)
     } else if (memRows.length === 0 && localMems.length > 0) {
-      await syncMemoriesToNeon(localMems)
+      await syncMemoriesToDB(localMems)
       console.log(`[db] uploaded ${localMems.length} session memories to DB`)
     }
   } catch (e) { console.error('[db] init error:', e.message) }
@@ -1268,5 +1268,5 @@ async function initNeon() {
 const PORT = process.env.PORT || 3005
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`[voice-trainer] started on http://localhost:${PORT}`)
-  initNeon()
+  initDB()
 })
