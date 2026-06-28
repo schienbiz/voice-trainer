@@ -12,15 +12,14 @@ const { Pool } = pkg
 
 dotenv.config()
 
-// ── CockroachDB ───────────────────────────────────────────────────────────────
-// Use CA cert if present (~/.postgresql/root.crt). Needed on macOS Monterey
-// (chusMBp) which doesn't trust CockroachDB's intermediate CA by default.
-// Strip sslmode from URL — pg driver's URL sslmode overrides the ssl config
-// object and prevents the ca cert from being applied.
+// ── Supabase / PostgreSQL SSL ──────────────────────────────────────────────────
+// chusMBp macOS: ~/.postgresql/root.crt = Supabase Root 2021 CA → verify-full
+// Render Docker (Linux): no root.crt → rejectUnauthorized:false (Supabase uses
+// self-signed CA not trusted by Node.js built-in bundle; conn still encrypted)
 const _vtRootCrt = path.join(homedir(), '.postgresql', 'root.crt')
 const _vtSslOpts = fs.existsSync(_vtRootCrt)
   ? { rejectUnauthorized: true, ca: fs.readFileSync(_vtRootCrt).toString() }
-  : { rejectUnauthorized: true }
+  : { rejectUnauthorized: false }
 
 const db = process.env.VOICE_DATABASE_URL
   ? new Pool({
