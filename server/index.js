@@ -363,6 +363,8 @@ const streamLimit   = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: tr
 const topicLimit    = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
 const coachLimit    = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false })
 const rebuildLimit  = rateLimit({ windowMs: 60_000, max:  3, standardHeaders: true, legacyHeaders: false })
+const mutateLimit   = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
+const genLimit      = rateLimit({ windowMs: 60_000, max:  5, standardHeaders: true, legacyHeaders: false })
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'voice-trainer', v: 2 }))
 
@@ -590,7 +592,7 @@ app.get('/api/history', (req, res) => {
   res.json(filtered.slice(0, limit))
 })
 
-app.delete('/api/history/:id', requireAuth, (req, res) => {
+app.delete('/api/history/:id', mutateLimit, requireAuth, (req, res) => {
   const { id } = req.params
   const all = readConvs()
   const idx = all.findIndex(c => c.id === id)
@@ -718,7 +720,7 @@ app.get('/api/templates', (req, res) => {
 
 // ── API: Apply a single template to ROS ──────────────────────────────────────
 
-app.post('/api/templates/apply', requireAuth, async (req, res) => {
+app.post('/api/templates/apply', mutateLimit, requireAuth, async (req, res) => {
   const { category, text } = req.body
   if (!category || !text) return res.status(400).json({ error: 'category and text required' })
 
@@ -759,7 +761,7 @@ app.post('/api/templates/apply', requireAuth, async (req, res) => {
 
 // ── API: Generate Relationship OS templates ───────────────────────────────────
 
-app.post('/api/generate-templates', requireAuth, async (req, res) => {
+app.post('/api/generate-templates', genLimit, requireAuth, async (req, res) => {
   const profile = readProfile()
   const cleanSamples = readConvs().filter(c => !c.deleted)
   if (cleanSamples.length < 5) {
@@ -853,7 +855,7 @@ app.get('/api/session/memories', requireAuth, (req, res) => {
 
 // ── API: End session — generate qualitative memory ────────────────────────────
 
-app.post('/api/session/end', requireAuth, async (req, res) => {
+app.post('/api/session/end', mutateLimit, requireAuth, async (req, res) => {
   const { messages = [], sessionSamples = 0 } = req.body
   if (!Array.isArray(messages) || messages.length > 200)
     return res.status(400).json({ error: 'invalid messages' })
