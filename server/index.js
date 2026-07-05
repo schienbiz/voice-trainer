@@ -72,6 +72,28 @@ async function syncMemoriesToDB(memories) {
   } catch (e) { console.error('[db] memories sync error:', e.message) }
 }
 
+async function syncTopicsUsedToDB(topics) {
+  if (!db) return
+  try {
+    await dbRun(
+      `INSERT INTO topics_used (id, data, updated_at) VALUES ('default', $1, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
+      [JSON.stringify(topics)]
+    )
+  } catch (e) { console.error('[db] topics sync error:', e.message) }
+}
+
+async function syncTemplatesToDB(templates) {
+  if (!db) return
+  try {
+    await dbRun(
+      `INSERT INTO templates (id, data, updated_at) VALUES ('default', $1, NOW())
+       ON CONFLICT (id) DO UPDATE SET data = $1, updated_at = NOW()`,
+      [JSON.stringify(templates)]
+    )
+  } catch (e) { console.error('[db] templates sync error:', e.message) }
+}
+
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const ROOT      = path.join(__dirname, '..')
 const DATA_DIR  = path.join(ROOT, 'data')
@@ -219,6 +241,7 @@ function readTopicsUsed() {
 function writeTopicsUsed(data) {
   _topicsUsedCache = data
   writeJSON(TOPICS_USED_FILE, data)
+  syncTopicsUsedToDB(data).catch(() => {})
 }
 
 // In-memory cache for conversations.json — avoids repeated disk reads on analyze/history/export
@@ -657,6 +680,7 @@ function readTemplates() {
 function saveTemplates(tmpl) {
   _templatesCache = tmpl
   writeJSON(TMPL_FILE, tmpl)
+  syncTemplatesToDB(tmpl).catch(() => {})
 }
 
 async function pushTemplatesToROS(templates) {
@@ -1217,6 +1241,18 @@ async function initDB() {
         data JSONB NOT NULL,
         updated_at TIMESTAMPTZ DEFAULT NOW()
       )`)
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS topics_used (
+        id TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`)
+    await dbRun(`
+      CREATE TABLE IF NOT EXISTS templates (
+        id TEXT PRIMARY KEY,
+        data JSONB NOT NULL,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )`)
     console.log('[db] schema ready')
 
     const { rows: [{ n: dbCount }] } = await dbRun('SELECT COUNT(*)::int AS n FROM voice_samples')
@@ -1260,6 +1296,36 @@ async function initDB() {
     } else if (memRows.length === 0 && localMems.length > 0) {
       await syncMemoriesToDB(localMems)
       console.log(`[db] uploaded ${localMems.length} session memories to DB`)
+    }
+
+    // topics_used bidirectional sync (object keyed by category → recent topic list)
+    const { rows: topicRows } = await dbRun('SELECT data FROM topics_used WHERE id = $1', ['default'])
+    const localTopics = readTopicsUsed()
+    const localTopicsEmpty = !localTopics || Object.keys(localTopics).length === 0
+    if (topicRows.length > 0 && localTopicsEmpty) {
+      const restored = topicRows[0].data && typeof topicRows[0].data === 'object' ? topicRows[0].data : {}
+      _topicsUsedCache = restored
+      writeJSON(TOPICS_USED_FILE, restored)  // raw write — avoid re-syncing back to DB
+      console.log(`[db] restored topics-used (${Object.keys(restored).length} categories) from DB`)
+    } else if (topicRows.length === 0 && !localTopicsEmpty) {
+      await syncTopicsUsedToDB(localTopics)
+      console.log(`[db] uploaded topics-used to DB`)
+    }
+
+    // templates bidirectional sync (AI-generated conversation templates per category)
+    const { rows: tmplRows } = await dbRun('SELECT data FROM templates WHERE id = $1', ['default'])
+    const localTmpl = readTemplates()
+    const localTmplEmpty = !localTmpl || !localTmpl.templates || Object.keys(localTmpl.templates).length === 0
+    if (tmplRows.length > 0 && localTmplEmpty) {
+      const restored = tmplRows[0].data && typeof tmplRows[0].data === 'object' ? tmplRows[0].data : null
+      if (restored) {
+        _templatesCache = restored
+        writeJSON(TMPL_FILE, restored)  // raw write — avoid re-syncing back to DB
+        console.log(`[db] restored templates from DB`)
+      }
+    } else if (tmplRows.length === 0 && !localTmplEmpty) {
+      await syncTemplatesToDB(localTmpl)
+      console.log(`[db] uploaded templates to DB`)
     }
   } catch (e) { console.error('[db] init error:', e.message) }
 }
