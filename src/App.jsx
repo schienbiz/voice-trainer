@@ -148,6 +148,7 @@ export default function App() {
   const [rebuilding, setRebuilding] = useState(false)
   const [authError, setAuthError] = useState(false)
   const [authTokenInput, setAuthTokenInput] = useState('')
+  const [confirmDeleteId, setConfirmDeleteId] = useState(null)  // sample id pending delete confirmation
 
   // Auto-mic (hands-free mode)
   const [autoMicEnabled, setAutoMicEnabled] = useState(false)
@@ -265,13 +266,20 @@ export default function App() {
     return () => clearInterval(interval)
   }, [fetchProviders])
 
-  const deleteHistorySample = useCallback(async (id) => {
-    if (!confirm('刪除這個樣本？（不可復原）')) return
+  // Open confirm modal — window.confirm() silently returns true in an installed PWA (iOS/Android standalone)
+  const deleteHistorySample = useCallback((id) => {
+    setConfirmDeleteId(id)
+  }, [])
+
+  const performDeleteSample = useCallback(async () => {
+    const id = confirmDeleteId
+    if (!id) return
+    setConfirmDeleteId(null)
     const dr = await fetch(`${API}/history/${id}`, { method: 'DELETE', headers: getAuthHeaders() })
     if (handleAuthFail(dr.status)) return
     setHistory(h => h.filter(x => x.id !== id))
     showFeedback('已刪除。建議在風格報告頁點「重建風格報告」更新統計。')
-  }, [])
+  }, [confirmDeleteId])
 
   const rebuildProfile = useCallback(async () => {
     setRebuilding(true)
@@ -816,6 +824,29 @@ export default function App() {
             >
               確認，重新連線
             </button>
+          </div>
+        </div>
+      )}
+      {/* Delete-confirm modal — replaces window.confirm() which is silently true in installed PWA */}
+      {confirmDeleteId && (
+        <div style={{ position: 'fixed', inset: 0, background: '#000000cc', display: 'flex', alignItems: 'center', justifyContent: 'center', zIndex: 9999 }}>
+          <div style={{ background: '#13131a', border: '1px solid #ff6b6b55', borderRadius: 16, padding: 32, width: 320 }}>
+            <div style={{ fontSize: 18, fontWeight: 700, color: '#fff', marginBottom: 6 }}>🗑 刪除這個樣本？</div>
+            <div style={{ fontSize: 12, color: '#888', marginBottom: 20 }}>此操作不可復原。刪除後建議在風格報告頁點「重建風格報告」更新統計。</div>
+            <div style={{ display: 'flex', gap: 10 }}>
+              <button
+                onClick={() => setConfirmDeleteId(null)}
+                style={{ flex: 1, padding: 10, borderRadius: 8, border: '1px solid #2a2a3a', background: '#0d0d15', color: '#e8e8f0', fontWeight: 600, cursor: 'pointer', fontSize: 14 }}
+              >
+                取消
+              </button>
+              <button
+                onClick={performDeleteSample}
+                style={{ flex: 1, padding: 10, borderRadius: 8, border: 'none', background: '#ff6b6b', color: '#fff', fontWeight: 600, cursor: 'pointer', fontSize: 14 }}
+              >
+                刪除
+              </button>
+            </div>
           </div>
         </div>
       )}

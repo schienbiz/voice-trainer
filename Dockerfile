@@ -8,13 +8,13 @@ RUN npm ci
 COPY . .
 RUN npm run build
 
-# Empty defaults — DB is source of truth; server restores data on startup.
-# CockroachDB cert not needed: Node.js 20 on Linux trusts CockroachDB Serverless
-# certs via its built-in CA bundle. Server falls back gracefully if cert absent.
+# Empty defaults — DB (Supabase) is source of truth; server restores data on startup
+# (conversations, profile, topics-used, templates, session-memories all sync from DB).
+# No root.crt on Linux → server uses rejectUnauthorized:false for Supabase (still encrypted).
 RUN mkdir -p data && \
     echo '[]' > data/conversations.json && \
     echo '{}' > data/voice-profile.json && \
-    echo '[]' > data/topics-used.json
+    echo '{}' > data/topics-used.json
 
 ENV NODE_ENV=production
 ENV PORT=7860
