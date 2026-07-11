@@ -1,8 +1,5 @@
 node_modules/
 dist/
 .env
-data/conversations.json
-data/topics-used.json
-data/templates.json
-data/voice-profile.json
+data/
 .gstack/
