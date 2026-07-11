@@ -262,8 +262,15 @@ export default function App() {
   }, [])
 
   useEffect(() => {
-    const interval = setInterval(fetchProviders, 60_000)
-    return () => clearInterval(interval)
+    // Only poll while the tab is visible. A forgotten/backgrounded tab polling /api/providers
+    // every 60s resets Render's 15-min spindown clock and keeps the free instance awake 24/7
+    // (2026-07-11 forensic: this exact loop from a background tab held voice-trainer at ~92%
+    // awake, burning the smritichain pool). Refetch on return so it's fresh when you come back.
+    const tick = () => { if (!document.hidden) fetchProviders() }
+    const interval = setInterval(tick, 60_000)
+    const onVisible = () => { if (!document.hidden) fetchProviders() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { clearInterval(interval); document.removeEventListener('visibilitychange', onVisible) }
   }, [fetchProviders])
 
   // Open confirm modal — window.confirm() silently returns true in an installed PWA (iOS/Android standalone)
