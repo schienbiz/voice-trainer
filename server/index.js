@@ -357,6 +357,24 @@ app.set('trust proxy', 1)  // Render sits behind a proxy; needed for accurate pe
 app.use(cors({ origin: (origin, cb) => cb(null, true), credentials: true }))
 app.use(express.json({ limit: '64kb' }))
 
+// ⚠️ TEMP forensic access-logger (2026-07-11) — REMOVE after diagnosis.
+// This free instance sits at ~92% awake with 0 completed HTTP requests + near-zero bandwidth =
+// a persistent streaming connection (SSE + 15s heartbeat) is holding it up, but the app never
+// logged requests so the holder is invisible. Log each request's origin (IP/UA/path) on arrival
+// and its hold duration on close — a multi-minute held stream will expose exactly who/what.
+app.use((req, res, next) => {
+  if (req.path === '/health' || req.path === '/favicon.ico' || req.path.startsWith('/assets')) return next()
+  const t0 = Date.now()
+  const xff = req.headers['x-forwarded-for'] || ''
+  const ua = (req.headers['user-agent'] || '').slice(0, 120)
+  console.log(`[access] ${req.method} ${req.path} ip=${req.ip} xff=${xff} ua="${ua}"`)
+  res.on('close', () => {
+    const held = Date.now() - t0
+    if (held > 5000) console.log(`[access-close] ${req.method} ${req.path} heldMs=${held} ip=${req.ip}`)
+  })
+  next()
+})
+
 // Per-IP rate limits — protect API keys from abuse
 const analyzeLimit  = rateLimit({ windowMs: 60_000, max: 20, standardHeaders: true, legacyHeaders: false })
 const streamLimit   = rateLimit({ windowMs: 60_000, max: 30, standardHeaders: true, legacyHeaders: false })
