@@ -399,6 +399,10 @@ export default function App() {
             ),
           },
         }))
+      } else if (r.status === 503) {
+        // Cloud (Render) build has no public path to ROS on chusMBp (ngrok retired 2026-07-11).
+        // Apply from the chusMBp local instance over Tailscale instead.
+        showFeedback({ type: 'error', msg: '❌ 雲端版無法直接套用到 ROS。請改用 chusMBp 本機（Tailscale :3005）開啟 Voice Trainer 套用。' })
       } else {
         showFeedback({ type: 'error', msg: `❌ 套用失敗：${data.error}` })
       }
